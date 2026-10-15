@@ -1,148 +1,224 @@
 # WasmGate
 
-> Высокопроизводительный сетевой прокси-шлюз на Go с плагинами на WebAssembly,
-> управлением без простоя и встроенной защитой от DDoS.
+Сетевой прокси-шлюз на Go. Ядро реализует L4/TCP-проксирование; в развитии
+предусмотрены плагины на WebAssembly, применение конфигурации без разрыва
+соединений и встроенная защита от DDoS.
 
-**Статус:** research / concept (этап проектирования ВКР)
-**Стек ядра:** Go (data plane) + C#/.NET (control plane) + WebAssembly (plugins)
-**Кодовое имя:** WasmGate (`wasmgate`)
+Репозиторий содержит рабочий прототип ядра и проектную документацию (материалы
+ВКР).
 
----
-
-## TL;DR
-
-`WasmGate` — это лёгкий прокси-шлюз, который закрывает три боли тяжёлых решений
-(nginx, Envoy, HAProxy, Kong, OpenResty):
-
-1. **Расширяемость «лёгким движением пальца»** — плагины пишутся на **любом языке**
-   и компилируются в **WebAssembly**. Никаких C-модулей, пересборки и Lua с GC.
-2. **Ноль простоя при смене логики** — **Zero-Downtime Hot Reload**: новая
-   конфигурация и новые плагины подхватываются атомарно, старые соединения
-   доживают и «дрейнятся».
-3. **Защита в ядре** — «умная» **защита от DDoS на скользящем окне**, работающая
-   в hot path без блокировок и без аллокаций на запрос.
-
-За производительностью — отдельная дисциплина: zero-alloc fast path, отсутствие
-CGO, профилирование и воспроизводимые замеры (benchstat / wrk2 / k6).
+| Параметр | Значение |
+|----------|----------|
+| Статус | прототип ядра (этапы M0/M1), этап проектирования ВКР |
+| Data plane | Go 1.23+ |
+| Control plane (план) | C#/.NET 8, gRPC поверх Unix Domain Socket |
+| Плагины (план) | WebAssembly ([wazero](https://github.com/tetratelabs/wazero)) |
+| Лицензия | MIT |
 
 ---
 
-## Что в ядре, а что — в расширениях
+## Обзор
 
-| № | Фича | Роль | Состояние в коде |
-|---|------|------|------------------|
-| **F2** | Smart DDoS (скользящее окно) | **Ядро — первая фича** | ещё не начато (следующий шаг) |
-| **F1** | Zero-Downtime Hot Reload + C# Control Plane | Усиление | каркас готов (`atomic` snapshot); Control Plane — план |
-| **F3** | Deep Packet Inspection (zero-alloc JSON) | Future work | требует L7-этапа |
-| **F4** | eBPF-интеграция для фильтрации | Future work | только Linux |
+WasmGate проектируется как прокси-шлюз с расширяемостью через WebAssembly.
+Целевые свойства:
 
-> Детальное обоснование выбора — в [`docs/04-diploma-features.md`](docs/04-diploma-features.md).
+- расширяемость без пересборки ядра: плагин компилируется в `.wasm` и
+  исполняется в sandbox;
+- применение конфигурации и версий плагинов без разрыва активных соединений
+  (Zero-Downtime Hot Reload);
+- защита периметра на скользящем окне, работающая в горячем пути без блокировок.
 
----
-
-## Структура документации
-
-| Документ | Что внутри | Кому |
-|----------|------------|------|
-| [`docs/01-problem.md`](docs/01-problem.md) | Проблема, персоны, user-flow AS-IS/TO-BE, гипотезы, метрики успеха | Введение в ВКР, защита |
-| [`docs/02-architecture-tech.md`](docs/02-architecture-tech.md) | Архитектура, стек, библиотеки, кодстайл, ADR, плагинная модель | Гл. 2 (проектирование) |
-| [`docs/03-mvp.md`](docs/03-mvp.md) | MVP (L4 TCP), скоуп, DoD, **методика замеров baseline** | Гл. 3–4 (реализация/оценка) |
-| [`docs/04-diploma-features.md`](docs/04-diploma-features.md) | Разбор 4 фич, матрица impact/effort, выбор ядра | Обоснование новизны |
-| [`docs/05-roadmap-thesis.md`](docs/05-roadmap-thesis.md) | План работ, milestones, структура ВКР, артефакты защиты | Планирование |
-| [`docs/07-glossary.md`](docs/07-glossary.md) | Глоссарий терминов (L4, splice, RCU, WASM, sliding window…) | Памятка |
-| [`DEVELOPMENT.md`](DEVELOPMENT.md) | Команды, структура кода, рецепты «как добавить X» | Ежедневная работа |
+Постановка задачи и обоснование выбора ядра приведены в
+[`docs/01-problem.md`](docs/01-problem.md) и
+[`docs/04-diploma-features.md`](docs/04-diploma-features.md).
 
 ---
 
-## Технологический стек (кратко)
+## Возможности
 
-- **Data Plane:** Go 1.23+, стандартный `net` (горутина на соединение, epoll под
-  капотом), zero-copy `splice(2)` на Linux. `gnet` — опциональная оптимизация.
-- **Plugin Runtime:** [`wazero`](https://github.com/tetratelabs/wazero) — WebAssembly
-  рантайм на чистом Go, **без CGO**, sandbox по памяти/CPU/времени.
-- **Control Plane:** C#/.NET 8, ASP.NET Core + **gRPC** (UDS) для управления.
-- **Наблюдаемость:** Prometheus, OpenTelemetry, `zerolog`, `pprof`.
-- **Замеры:** `wrk2`, `k6`, `benchstat`, `pprof`, `iperf3`.
+### Реализовано (прототип, этапы M0/M1)
+
+- L4/TCP reverse proxy на стандартном `net` (горутина на соединение).
+- Балансировка: `round_robin`, `least_conn`.
+- Проксирование через `io.Copy`; на Linux используется `splice(2)` (zero-copy).
+- Таймауты `dial_timeout` и `idle_timeout` (опционально), лимит `max_conns`.
+- Полу-закрытие (half-close) и корректное завершение при ошибке либо отмене
+  контекста.
+- Graceful shutdown с drain активных соединений.
+- Перезагрузка конфигурации по `SIGHUP` (Unix) через атомарную подмену snapshot.
+- Строгая валидация конфигурации.
+- Структурное логирование (`log/slog`).
+- Сборка без CGO; юнит- и интеграционные тесты.
+
+### Планируется
+
+- DDoS / rate limiting на скользящем окне (первая фича ядра).
+- Хуки плагинов WASM: `on_accept`, `on_data`, `on_close`.
+- TLS passthrough через SNI peek и опциональная терминация.
+- Health-checks upstream.
+- Метрики и `pprof`.
+- C# control plane: версии конфигурации, публикация, откат.
+- DPI и eBPF (future work).
 
 ---
 
-## Диаграмма (одним взглядом)
+## Архитектура
 
 ```
-            ┌──────────────────────── Контроль (Control Plane) ────────────────────────┐
-            │  C# / .NET 8 · ASP.NET Core · gRPC                                        │
-            │  • версии конфига   • реестр WASM-плагинов   • health-gate   • rollback   │
-            └───────────────────────────────┬──────────────────────────────────────────┘
-                                            │ gRPC over Unix Domain Socket
-                                            ▼
-   clients ─────────▶  ┌──────────────────────────────────────────────────────────────┐
-                       │                 Data Plane (Go, fast path)                    │
-                       │  net accept-loop → TLS/SNI peek → DDoS sliding window →        │
-                       │  routing/balancer → upstream pool → WASM hooks (wazero)       │
-                       │  atomic.Pointer[Config]  ⇒  HOT RELOAD без рестарта            │
-                       └───────────────────────────────┬──────────────────────────────┘
-                                                       ▼
-                                                  upstreams
+клиенты
+   |
+   v
+[ Data Plane (Go) ]  accept -> балансировка -> dial upstream -> copy (splice)
+   |                        ^
+   |                        +-- Snapshot (atomic.Pointer) <-- hot reload (SIGHUP)
+   v
+upstream pool
+
+[ Control Plane (C#/.NET, gRPC/UDS) ]  версии конфигурации, публикация, откат (план)
 ```
 
----
+Ядро работает на уровне L4: решения принимаются по IP/порту и метаданным
+соединения, прикладной протокол не разбирается. Разбор содержимого потока
+(SNI peek, хуки `on_data`, DPI) относится к последующим этапам. При переходе к
+инспекции тела направление копирования переключается с zero-copy `splice` на
+буферизованный путь.
 
-## Как читать эти документы
-
-1. Начни с [`01-problem.md`](docs/01-problem.md) — понять, *какую боль* решаем.
-2. Затем [`02-architecture-tech.md`](docs/02-architecture-tech.md) — *как* устроено и на чём.
-3. [`03-mvp.md`](docs/03-mvp.md) — *что делаем первым* и *как меряем*.
-4. [`04-diploma-features.md`](docs/04-diploma-features.md) — *чем отличаемся* и *почему*.
-5. [`05-roadmap-thesis.md`](docs/05-roadmap-thesis.md) — *план и структура диплома*.
-6. [`DEVELOPMENT.md`](DEVELOPMENT.md) — *как работать с кодом и командами*.
+Подробнее: [`docs/02-architecture-tech.md`](docs/02-architecture-tech.md).
 
 ---
 
-## Быстрый старт (MVP)
+## Состояние проекта
 
-Текущее состояние: **M0/M1 — рабочий L4 TCP reverse proxy** (round-robin /
-least-conn балансировка, graceful shutdown, atomic snapshot под будущий hot
-reload). Сложные фичи ещё не реализованы, но под них заложены «швы».
+| Milestone | Содержание | Deliverable | Статус |
+|-----------|------------|-------------|--------|
+| M0. Skeleton | accept-loop, логирование, каркас | бинарь принимает соединения | готово |
+| M1. Proxy core | пулы, балансировка, copy/splice, таймауты | проксирование TCP end-to-end | готово |
+| M2. Config + reload + drain | YAML, snapshot, atomic swap, SIGHUP, drain | reload без разрыва соединений | каркас |
+| M3. Observe + hardening | метрики, `pprof`, health-checks, CLI | наблюдаемый прокси | план |
 
-> 📘 Полный гайд по командам, структуре кода и рецептам («как добавить X») —
-> в [`DEVELOPMENT.md`](DEVELOPMENT.md).
+После M3 в ядро добавляется DDoS sliding window, затем WASM host и control plane.
+Drain и её соответствие требованиям проверяются chaos-тестом.
+
+---
+
+## Требования
+
+- Go 1.23 или новее.
+- C-компилятор нужен только для `go test -race` (CGO). На Windows удобнее
+  запускать race-тесты в WSL; на Linux компилятор обычно уже доступен.
+- Windows: PowerShell. Unix: любой shell.
+
+---
+
+## Быстрый старт
 
 ```bash
-go build -o bin/wasmgate.exe ./cmd/wasmgate     # сборка
-go test ./...                                    # тесты (‑race требует CGO)
-.\bin\wasmgate.exe -config configs\wasmgate.yaml # запуск
+# сборка
+go build -o bin/wasmgate.exe ./cmd/wasmgate
+
+# запуск с примером конфигурации
+./bin/wasmgate.exe -config configs/wasmgate.yaml
+
+# либо без сборки
+go run ./cmd/wasmgate -config configs/wasmgate.yaml
 ```
 
-Направьте `pools.*.servers` в примере конфига на свои TCP-сервисы. Останов —
-Ctrl+C (graceful drain). На Linux `SIGHUP` перечитывает конфиг без рестарта.
+Параметры: `-config` (путь к конфигурации), `-log-level` (`debug`/`info`/`warn`/
+`error`), `-shutdown-grace` (ожидание активных соединений при останове).
 
-### Структура репозитория
+Останов: `Ctrl+C` (graceful drain). На Linux `SIGHUP` перечитывает конфигурацию
+без перезапуска.
+
+Перед запуском укажите в `configs/wasmgate.yaml` реальные адреса в
+`pools.*.servers`. Для локальной проверки предусмотрен `configs/local-echo.yaml`
+(порядок smoke-теста описан в [`DEVELOPMENT.md`](DEVELOPMENT.md), §5).
+
+---
+
+## Конфигурация
+
+```yaml
+version: 1
+
+listeners:
+  - name: edge
+    addr: "127.0.0.1:8080"
+    upstream_pool: web
+    max_conns: 10000
+    dial_timeout: 3s
+    idle_timeout: 0s
+
+pools:
+  web:
+    balance: round_robin
+    servers:
+      - "127.0.0.1:9001"
+      - "127.0.0.1:9002"
+```
+
+Правила:
+
+- `version` должен быть равен `1`;
+- имена listeners уникальны, `upstream_pool` должен существовать;
+- `addr` и `servers` задаются как корректный `host:port` с числовым портом;
+- пул не может быть пустым и не может содержать дубли серверов;
+- `balance` принимает значения `round_robin` или `least_conn`;
+- неизвестные ключи конфигурации отклоняются при загрузке.
+
+По умолчанию `idle_timeout: 0` (таймаут простоя отключён), что сохраняет
+zero-copy `splice`. При `idle_timeout > 0` включается буферизованное копирование с
+read-deadline, и `splice` для соответствующего направления отключается.
+
+Полное описание полей: [`DEVELOPMENT.md`](DEVELOPMENT.md), §9.
+
+---
+
+## Структура репозитория
 
 ```
-cmd/wasmgate/        точка входа + обработка сигналов (unix/windows)
-internal/config/     схема YAML, загрузка, валидация, тип Duration
-internal/proxy/      data plane: листенеры, балансировка, copy/splice, snapshot
+cmd/wasmgate/        точка входа и обработка сигналов (unix/windows)
+internal/config/     схема YAML, загрузка, валидация
+internal/proxy/      ядро data plane: сервер, прокси, пулы, балансировщики, copy, snapshot
 internal/observe/    логирование (log/slog)
 configs/             примеры конфигурации
-plugins/ benchmarks/ deployments/   заглушки под будущие milestone'ы
-docs/                проектная документация (Obsidian-совместимая)
+docs/                проектная документация
+plugins/             примеры плагинов (в разработке)
+benchmarks/          сценарии нагрузки (в разработке)
+deployments/         конфигурации развёртывания (в разработке)
 ```
 
-### Ключевые «швы» под продукт
+---
 
-- `internal/proxy/snapshot.go` — **`Runtime` + `Snapshot`** на `atomic.Pointer`:
-  основа **Zero-Downtime Hot Reload**. Чтение в data path — без блокировок.
-- `internal/proxy/proxy.go` — точка вставки **DDoS/rate-limit** (перед dial) и
-  **WASM-хуков** (`on_accept`/`on_data`/`on_close`).
-- `internal/proxy/upstream.go` — интерфейс **`Balancer`** для новых стратегий.
+## Документация
 
-### Учтено по «граблям»
+| Документ | Содержание |
+|----------|------------|
+| [`docs/01-problem.md`](docs/01-problem.md) | Постановка задачи, пользователи, гипотезы, метрики успеха |
+| [`docs/02-architecture-tech.md`](docs/02-architecture-tech.md) | Архитектура, стек, соглашения, ADR, модель плагинов |
+| [`docs/03-mvp.md`](docs/03-mvp.md) | Границы MVP, Definition of Done, методика замеров |
+| [`docs/04-diploma-features.md`](docs/04-diploma-features.md) | Разбор фич, приоритизация, выбор ядра |
+| [`docs/05-roadmap-thesis.md`](docs/05-roadmap-thesis.md) | План работ, milestones, структура ВКР |
+| [`docs/07-glossary.md`](docs/07-glossary.md) | Глоссарий терминов |
+| [`DEVELOPMENT.md`](DEVELOPMENT.md) | Рабочий гайд: команды, структура кода, рецепты |
 
-- **32/64-бит**: везде используются *типизированные* атомики (`atomic.Int64`,
-  `atomic.Uint64`), которые гарантируют выравнивание и не падают на 386/arm.
-  Сырые `atomic.AddInt64(&field, 1)` не используются.
-- **Парсинг `time.Duration` из YAML**: обёртка `config.Duration` (yaml.v3 не
-  умеет в Stringer/Duration «из коробки»).
-- **Опечатки в конфиге**: `KnownFields(true)` → неизвестный ключ = ошибка.
-- **Кросс-платформа сигналов**: `SIGHUP` только на Unix; на Windows — Ctrl+C.
-- **Кэш-линии**: пока не паддим (осознанно отложено), но отмечено в коде.
+Рекомендуемый порядок чтения: 01, 02, 03, 04, 05, затем `DEVELOPMENT.md`.
+
+---
+
+## Разработка
+
+```bash
+gofmt -l .          # проверка форматирования
+go vet ./...        # статический анализ
+go test ./...       # тесты
+go build ./...      # сборка
+```
+
+Команды для бенчмарков, профилирования и smoke-теста, а также соглашения о коде и
+коммитах приведены в [`DEVELOPMENT.md`](DEVELOPMENT.md).
+
+---
+
+## Лицензия
+
+MIT. См. [`LICENSE`](LICENSE).
