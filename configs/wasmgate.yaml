@@ -1,0 +1,30 @@
+# WasmGate — example configuration (MVP, L4 TCP).
+#
+# The gateway is a raw TCP reverse proxy: it accepts connections on `listeners`
+# and forwards them to one of the backends in the referenced pool.
+version: 1
+
+listeners:
+  - name: edge
+    addr: "127.0.0.1:8080"
+    upstream_pool: web
+    max_conns: 10000          # reserved for a later milestone
+    dial_timeout: 3s
+    idle_timeout: 60s         # reserved for a later milestone
+
+  - name: db
+    addr: "127.0.0.1:5433"
+    upstream_pool: postgres
+    dial_timeout: 2s
+
+pools:
+  web:
+    balance: round_robin      # round_robin | least_conn
+    servers:
+      - "127.0.0.1:9001"
+      - "127.0.0.1:9002"
+
+  postgres:
+    balance: least_conn
+    servers:
+      - "127.0.0.1:5432"

@@ -1,0 +1,26 @@
+# golangci-lint configuration.
+# NOTE: schema targets golangci-lint v1.x. If you install v2.x, run
+# `golangci-lint migrate` or adjust `version`/`linters.settings`.
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - errcheck     # unhandled errors
+    - govet
+    - staticcheck
+    - revive       # style
+    - ineffassign
+    - unused
+    - gosec        # security
+    - bodyclose    # unclosed HTTP bodies
+    - noctx        # requests without context
+    - prealloc     # preallocate slices in hot code
+    - exhaustive   # exhaustive switch over enums
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gosec
+        - errcheck

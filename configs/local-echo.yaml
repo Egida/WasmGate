@@ -1,0 +1,20 @@
+# Local smoke-test configuration.
+#
+# Pairs with the PowerShell echo server in DEVELOPMENT.md §5:
+#   :8080  →  127.0.0.1:9001
+#
+# Run:
+#   go run ./cmd/wasmgate -config configs/local-echo.yaml -log-level debug
+version: 1
+
+listeners:
+  - name: echo
+    addr: "127.0.0.1:8080"
+    upstream_pool: echo
+    dial_timeout: 2s
+
+pools:
+  echo:
+    balance: round_robin
+    servers:
+      - "127.0.0.1:9001"

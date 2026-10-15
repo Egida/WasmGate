@@ -1,0 +1,32 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Profiling / benchmarks
+*.prof
+cpu.out
+mem.out
+old.txt
+new.txt
+
+# Local env / secrets (keep .env.example tracked)
+.env
+.env.*
+!.env.example
+
+# Obsidian vault config (docs are Markdown, config is not source)
+.obsidian/
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
