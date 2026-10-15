@@ -30,7 +30,7 @@
 | 1 | Приём TCP-соединений (`net`, горутина на соединение; epoll под капотом) | ✅ M0 |
 | 2 | Проксирование на upstream-пул (bidirectional copy, `splice` на Linux) | ✅ M1 |
 | 3 | Балансировка: round-robin / least-conn | ✅ M1 |
-| 4 | Таймауты: connect (есть), idle (M2); лимит `max_conns` (M2) | 🟡 частично |
+| 4 | Таймауты: connect, **idle**; лимит **`max_conns`** | ✅ M2 |
 | 5 | **TLS passthrough** через SNI-peek (без терминации); опц. терминация | ⏳ план |
 | 6 | Health-checks (активный TCP-connect + пассивный по ошибкам) | ⏳ план |
 | 7 | Конфиг из YAML + **hot reload** (SIGHUP — прообраз RCU) | ✅ M2 (каркас) |
@@ -156,6 +156,11 @@ upstream_pools:
 - [ ] `go test -benchmem` показывает **0 alloc** в steady state на fast path.
 - [ ] Сняты и задокументированы baseline-замеры (см. §8).
 - [ ] Кросс-сборка без CGO проходит (linux/amd64, linux/arm64).
+
+> **Fast path** — это `idle_timeout: 0` (по умолчанию): `io.Copy` идёт через
+> `splice`. Если включить `idle_timeout`, включается буферизованное копирование с
+> read-deadline, и zero-copy/splice для этого направления отключается. Бенчмарки
+> baseline снимаются с `idle_timeout: 0`.
 
 ---
 

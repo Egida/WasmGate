@@ -8,9 +8,10 @@ listeners:
   - name: edge
     addr: "127.0.0.1:8080"
     upstream_pool: web
-    max_conns: 10000          # reserved for a later milestone
-    dial_timeout: 3s
-    idle_timeout: 60s         # reserved for a later milestone
+    max_conns: 10000          # max concurrent connections (0 = unlimited)
+    dial_timeout: 3s          # upstream dial timeout
+    idle_timeout: 0s          # per-direction idle timeout; 0 = disabled (keeps zero-copy
+                              # splice); set e.g. 60s in production to reap silent conns
 
   - name: db
     addr: "127.0.0.1:5433"

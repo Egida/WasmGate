@@ -20,7 +20,8 @@
 //   - proxy.go    — Proxy.Handle: the per-connection pipeline (the hot path).
 //   - pool.go     — Pool: a set of upstreams behind one balancing strategy.
 //   - upstream.go — upstream endpoint and Balancer strategies (round-robin, least-conn).
-//   - copy.go     — join: bidirectional byte pump with half-close (zero-copy splice).
+//   - copy.go     — join: bidirectional byte pump with half-close; zero-copy
+//     splice on the fast path, idle-aware read deadlines otherwise.
 //
 // # Extension seams
 //

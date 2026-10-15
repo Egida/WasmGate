@@ -93,7 +93,7 @@ accept()
 | Слой | Выбор | Почему | Альтернативы (и почему нет) |
 |------|-------|--------|------------------------------|
 | Networking (L4) | **стандартный `net`** (горутина на соединение) | Просто и предсказуемо; backpressure и per-conn состояние «из коробки»; под капотом epoll; `io.Copy` использует `splice(2)` | `gnet` (event-loop) — опция для миллионов лёгких соединений, но добавляет сложность; `fasthttp` — это HTTP |
-| Zero-copy | `splice` (Linux) через `net.TCPConn.ReadFrom` | Копирование данных в ядре, а не в user-space | ручные `io.Copy` (медленнее) |
+| Zero-copy | `splice` (Linux) через `net.TCPConn.ReadFrom` | Копирование данных в ядре, а не в user-space | ручные `io.Copy` (медленнее) — включаются, когда задан `idle_timeout` |
 | WASM runtime | **`tetratelabs/wazero`** | Чистый Go, **нет CGO**, быстрый старт, sandbox, WASI | `wasmtime-go` (CGO), `wasmer-go` (CGO, тяжелее) |
 | JSON (future DPI) | `valyala/fastjson` / `bytedance/sonic` | Zero/низкие аллокации, SIMD (sonic) | `encoding/json` (рефлексия, аллокации) |
 | Config | `knadh/koanf` (или `yaml.v3` + `mapstructure`) | Лёгкий, без магии Viper | Viper (тяжелее) |
@@ -254,29 +254,40 @@ if err := dialUpstream(ctx, addr); err != nil {
 замена указателя. Читатели (обработчики соединений) не блокируются никогда.
 
 ```go
-// internal/proxy/snapshot.go — текущая (упрощённая) реализация
+// internal/proxy/snapshot.go — текущая реализация
 type Snapshot struct {
-    Version uint64
-    Config  *config.Config     // листенеры + пулы (данные из YAML)
-    Pools   map[string]*Pool   // скомпилированные пулы + живые счётчики
+    Version   uint64
+    Config    *config.Config              // листенеры + пулы (данные из YAML)
+    listeners map[string]resolvedListener // листенер → пул + лимит соединений
 }
 
-type Runtime struct{ cur atomic.Pointer[Snapshot] }
+type Runtime struct {
+    cur atomic.Pointer[Snapshot]
+    mu  sync.Mutex // сериализует Reload: версия — read-modify-write
+}
 
 // Load — один атомарный load; вызывается на КАЖДОМ соединении.
 func (r *Runtime) Load() *Snapshot { return r.cur.Load() }
 
 // Reload строит новый снапшот и публикует его (вызывает SIGHUP / Control Plane).
 func (r *Runtime) Reload(cfg *config.Config) uint64 {
+    r.mu.Lock()
+    defer r.mu.Unlock()
     next := buildSnapshot(r.cur.Load().Version+1, cfg)
     r.cur.Store(next) // RCU: старые читатели держат прошлый, новые видят новый
     return next.Version
 }
 ```
 
-> Целевая (более богатая) форма `Snapshot` добавит `Routes` (маршруты по SNI),
-> `Limits` (политики DDoS) и `Plugins` (активные версии WASM). Сейчас там только
-> `Config` + `Pools`, но механизм ровно тот же.
+> Сама замена указателя атомарна и в блокировке не нуждается, но **инкремент
+> версии** — это read-modify-write: без `mu` два одновременных reload могли бы
+> опубликовать одну и ту же версию. `mu` берётся только в `Reload`, на hot path
+> его нет.
+>
+> `listeners` — предвычисленный индекс: горячий путь достаёт листенер и его пул
+> **одним** обращением к map, вместо линейного поиска по списку. Целевая (более
+> богатая) форма `Snapshot` добавит `Routes` (маршруты по SNI), `Limits`
+> (политики DDoS) и `Plugins` (активные версии WASM), но механизм ровно тот же.
 
 **Drain-политика:**
 

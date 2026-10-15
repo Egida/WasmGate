@@ -95,3 +95,101 @@ pools:
 		t.Fatal("expected error for unknown pool, got nil")
 	}
 }
+
+func TestLoadRejectsMalformedListenerAddr(t *testing.T) {
+	path := write(t, `
+version: 1
+listeners:
+  - name: edge
+    addr: "not-an-address"
+    upstream_pool: web
+pools:
+  web:
+    servers: ["127.0.0.1:9000"]
+`)
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("expected error for malformed listener addr, got nil")
+	}
+}
+
+func TestLoadRejectsMalformedServerAddr(t *testing.T) {
+	path := write(t, `
+version: 1
+listeners:
+  - name: edge
+    addr: "127.0.0.1:0"
+    upstream_pool: web
+pools:
+  web:
+    servers: ["garbage"]
+`)
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("expected error for malformed server addr, got nil")
+	}
+}
+
+func TestLoadRejectsNegativeTimeout(t *testing.T) {
+	path := write(t, `
+version: 1
+listeners:
+  - name: edge
+    addr: "127.0.0.1:0"
+    upstream_pool: web
+    dial_timeout: -5s
+pools:
+  web:
+    servers: ["127.0.0.1:9000"]
+`)
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("expected error for negative dial_timeout, got nil")
+	}
+}
+
+func TestLoadRejectsDuplicateServers(t *testing.T) {
+	path := write(t, `
+version: 1
+listeners:
+  - name: edge
+    addr: "127.0.0.1:0"
+    upstream_pool: web
+pools:
+  web:
+    servers: ["127.0.0.1:9000", "127.0.0.1:9000"]
+`)
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("expected error for duplicate servers, got nil")
+	}
+}
+
+func TestLoadRejectsUnknownBalance(t *testing.T) {
+	path := write(t, `
+version: 1
+listeners:
+  - name: edge
+    addr: "127.0.0.1:0"
+    upstream_pool: web
+pools:
+  web:
+    balance: least_con
+    servers: ["127.0.0.1:9000"]
+`)
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("expected error for unknown balance, got nil")
+	}
+}
+
+func TestLoadRejectsWrongVersion(t *testing.T) {
+	path := write(t, `
+version: 2
+listeners:
+  - name: edge
+    addr: "127.0.0.1:0"
+    upstream_pool: web
+pools:
+  web:
+    servers: ["127.0.0.1:9000"]
+`)
+	if _, err := config.Load(path); err == nil {
+		t.Fatal("expected error for unsupported version, got nil")
+	}
+}

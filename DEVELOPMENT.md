@@ -10,9 +10,11 @@
 
 **Реализовано (M0/M1 + каркас M2):** L4 TCP reverse proxy на `net` — приём
 соединений, балансировка `round_robin`/`least_conn`, проксирование
-(`io.Copy` → `splice` на Linux), `dial_timeout`, half-close, graceful drain,
-reload конфига по SIGHUP через атомарный snapshot, структурные логи, сборка без
-CGO. Покрыто тестами (`go test ./...`).
+(`io.Copy` → `splice` на Linux; fast path при `idle_timeout: 0`), таймауты
+(`dial_timeout`, `idle_timeout`), лимит соединений `max_conns`, half-close и
+корректный teardown при ошибке/отмене контекста, graceful drain, reload конфига
+по SIGHUP через атомарный snapshot, строгая валидация конфига, структурные логи,
+сборка без CGO. Покрыто тестами (`go test ./...`).
 
 **Ещё не реализовано:** DDoS/rate-limit, WASM-плагины, SNI/TLS-peek, health-checks,
 метрики/pprof, CLI, нагрузочные бенчмарки. Куда встраивать — §10 «Рецепты».
@@ -80,9 +82,9 @@ WasmGate/
 │   │   ├── proxy.go         Proxy.Handle: обработка одного соединения
 │   │   ├── pool.go          Pool: upstream'ы + балансировщик
 │   │   ├── upstream.go      upstream + интерфейс Balancer (RR, least-conn)
-│   │   ├── copy.go          join(): двунаправленный copy (splice)
-│   │   ├── snapshot.go      Runtime/Snapshot: atomic-конфиг (шов hot reload)
-│   │   └── proxy_test.go    e2e-тест + тесты балансировщиков
+│   │   ├── copy.go          join(): двунаправленный copy (splice + idle/ctx)
+│   │   ├── snapshot.go      Runtime/Snapshot: atomic-конфиг + индекс листенеров
+│   │   └── proxy_test.go    e2e-тест + балансировщики, reload, max_conns, cancel
 │   └── observe/
 │       └── log.go           конструктор логгера (log/slog)
 ├── configs/
@@ -260,12 +262,14 @@ main.run()
 
 Соединение:
   acceptLoop()          server.go   Accept() → горутина на соединение
-    └─ Proxy.Handle()   proxy.go    rt.Load() → найти listener → взять Pool
+    └─ Proxy.Handle()   proxy.go    rt.Load() → резолв listener+pool (1 lookup)
+        ├─ max_conns    proxy.go    лимит соединений на listener (0 = без лимита)
         ├─ (FUTURE) DDoS-проверка
         ├─ pool.Next()  pool.go     балансировщик выбирает upstream (active++)
         ├─ DialContext  proxy.go    подключение к upstream (с dial_timeout)
-        └─ join()       copy.go     io.Copy в обе стороны (splice), half-close
-        └─ pool.Release(up)         active--
+        └─ join()       copy.go     copy в обе стороны; splice при idle_timeout=0,
+                                    иначе read-deadline по idle; teardown по ctx/ошибке
+        └─ pool.Release(up)         active-- (защищено от двойного release)
 ```
 
 Ключевая идея: **конфиг читается один раз на соединение** из `Snapshot`, и это
@@ -283,6 +287,10 @@ main.run()
 - `PoolConfig` — группа бэкендов (`balance`, `servers`).
 - `Duration` — обёртка над `time.Duration`, чтобы YAML понимал `"3s"`.
 - `Load(path)` — открыть → распарсить (`KnownFields(true)`) → дефолты → валидация.
+- Валидация (`applyDefaultsAndValidate`) отвергает: `version != 1`, пустой список
+  листенеров, дубли имён, неизвестный `upstream_pool`, некорректный адрес
+  (`host:port`, порт — число), отрицательные таймауты/`max_conns`, пустой пул,
+  дубли серверов и неизвестный `balance`. Сети не касается — адреса не резолвятся.
 
 Никакого runtime-состояния здесь нет — только данные.
 
@@ -321,9 +329,11 @@ func (r *Runtime) Reload(cfg *config.Config) uint64 // публикация но
 - **+2 горутины** внутри `join` (по одной на направление copy).
 - `sync.WaitGroup` в `Server` считает и accept-loop'ы, и обработчики — поэтому
   `Shutdown` дожидается полного drain.
-- **Конфиг** — `atomic.Pointer`, на горячем пути **нет блокировок**.
+- **Конфиг** — `atomic.Pointer`, на горячем пути **нет блокировок**; `Reload`
+  сериализуется мьютексом (версия — это read-modify-write).
 - **Счётчики upstream** — типизированные атомики (`atomic.Int64`), безопасны на 32/64-бит.
-- `sync.Mutex` только там, где не горячо: список листенеров.
+- `sync.Mutex` только там, где не горячо: список листенеров и `Reload`.
+- `ctx` доходит до `join`: отмена (shutdown) закрывает обе стороны соединения.
 
 ---
 
@@ -336,9 +346,9 @@ listeners:
   - name: edge              # уникальное имя (используется в логах/роутинге)
     addr: "127.0.0.1:8080"  # адрес прослушивания
     upstream_pool: web      # имя пула из pools
-    max_conns: 10000        # ЗАРЕЗЕРВИРОВАНО (M2), сейчас не применяется
+    max_conns: 10000        # лимит одновременных соединений (0 = без лимита)
     dial_timeout: 3s        # таймаут подключения к бэкенду (по умолчанию 5s)
-    idle_timeout: 60s       # ЗАРЕЗЕРВИРОВАНО (M2), сейчас не применяется
+    idle_timeout: 0s        # per-direction idle-таймаут; 0 = выкл (по умолчанию)
 
 pools:
   web:
@@ -348,8 +358,15 @@ pools:
       - "127.0.0.1:9002"
 ```
 
-Правила: имена listener'ов уникальны; `upstream_pool` обязан существовать; пул
-не может быть пустым; неизвестные ключи = ошибка загрузки.
+Правила: `version` строго `1`; имена listener'ов уникальны; `upstream_pool`
+обязан существовать; `addr`/`servers` — корректный `host:port` (порт числовой);
+пул не пустой и без дублей серверов; `balance` — `round_robin`/`least_conn`;
+таймауты и `max_conns` неотрицательны; неизвестные ключи = ошибка загрузки.
+
+> **`idle_timeout` и zero-copy.** `idle_timeout: 0` (по умолчанию) сохраняет
+> zero-copy `splice`. При `idle_timeout > 0` включается буферизованное копирование
+> с read-deadline (splice для этого направления отключается) — зато полу-открытые
+> «молчащие» соединения сбрасываются. В проде `idle_timeout` лучше задать.
 
 ---
 
@@ -414,7 +431,7 @@ pools:
 | `invalid duration "60"` | Нужна единица: `60s`, `1500ms` |
 | Импорты не находятся после смены пути модуля | `go mod tidy` |
 | `SIGHUP` ничего не делает на Windows | Ожидаемо — reload только на Unix |
-| Тест «висит» | Полу-открытое соединение; `idle_timeout` ещё не реализован (см. `copy.go` TODO) |
+| Тест/соединение «висит» | Полу-открытое соединение без трафика. Задай `idle_timeout > 0` (включает буферизованный путь с read-deadline) |
 
 ---
 

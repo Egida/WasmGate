@@ -6,21 +6,36 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Defaults applied when the value is omitted in the file.
+// Defaults and schema constants.
 const (
+	// DefaultDialTimeout is the upstream dial timeout used when a listener
+	// omits dial_timeout.
 	DefaultDialTimeout = 5 * time.Second
-	DefaultIdleTimeout = 60 * time.Second
+
+	// DefaultIdleTimeout is the per-direction idle timeout used when a listener
+	// omits idle_timeout.
+	//
+	// NOTE: an idle timeout is enforced on a buffered copy path, which disables
+	// the zero-copy splice(2) fast path. Keep the default at 0 (disabled) to
+	// preserve zero-copy by default; set idle_timeout explicitly in production
+	// to reap half-open connections.
+	DefaultIdleTimeout = 0 * time.Second
+
+	// ConfigVersion is the only schema version this build understands.
+	ConfigVersion = 1
 )
 
 // Config is the root of the configuration file.
 type Config struct {
-	Version   int                   `yaml:"version"`   // schema version (informational)
+	Version   int                   `yaml:"version"`   // schema version (must be 1)
 	Listeners []ListenerConfig      `yaml:"listeners"` // front-facing TCP listeners
 	Pools     map[string]PoolConfig `yaml:"pools"`     // backend groups, keyed by pool name
 }
@@ -30,14 +45,17 @@ type ListenerConfig struct {
 	Name         string   `yaml:"name"`          // unique name (used for logs and lookup)
 	Addr         string   `yaml:"addr"`          // listen address, e.g. "127.0.0.1:8080"
 	UpstreamPool string   `yaml:"upstream_pool"` // name of the target pool in Config.Pools
-	MaxConns     int      `yaml:"max_conns"`     // RESERVED (M2): not enforced yet
+	MaxConns     int      `yaml:"max_conns"`     // max concurrent connections; 0 = unlimited
 	DialTimeout  Duration `yaml:"dial_timeout"`  // upstream dial timeout (default 5s)
-	IdleTimeout  Duration `yaml:"idle_timeout"`  // RESERVED (M2): not enforced yet (default 60s)
+	IdleTimeout  Duration `yaml:"idle_timeout"`  // per-direction idle timeout; 0 disables (default 0)
 }
 
 // PoolConfig describes a group of backend endpoints.
 type PoolConfig struct {
-	Balance string   `yaml:"balance"` // "round_robin" (default) or "least_conn"
+	Balance string `yaml:"balance"` // "round_robin" (default) or "least_conn"
+	// Servers are backend "host:port" endpoints. Order is significant:
+	// round-robin visits them in order and least-conn breaks ties by it, so do
+	// not sort or reorder them casually.
 	Servers []string `yaml:"servers"`
 }
 
@@ -62,21 +80,15 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// Listener returns the listener with the given name.
-func (c *Config) Listener(name string) (ListenerConfig, bool) {
-	for i := range c.Listeners {
-		if c.Listeners[i].Name == name {
-			return c.Listeners[i], true
-		}
-	}
-	return ListenerConfig{}, false
-}
-
 // applyDefaultsAndValidate fills in default timeouts and rejects invalid
-// configurations: missing or duplicate listener names, unknown pool references,
-// negative connection limits, empty pools and unknown balance strategies. It
-// mutates c in place and is called by Load.
+// configurations: wrong schema version, missing or duplicate listener names,
+// malformed addresses, unknown pool references, negative limits/timeouts, empty
+// pools, duplicate servers and unknown balance strategies. It mutates c in
+// place and is called by Load.
 func (c *Config) applyDefaultsAndValidate() error {
+	if c.Version != ConfigVersion {
+		return fmt.Errorf("config: unsupported version %d (want %d)", c.Version, ConfigVersion)
+	}
 	if len(c.Listeners) == 0 {
 		return fmt.Errorf("config: no listeners defined")
 	}
@@ -96,14 +108,21 @@ func (c *Config) applyDefaultsAndValidate() error {
 		}
 		seen[l.Name] = true
 
+		if err := validateAddr(l.Addr, false); err != nil {
+			return fmt.Errorf("listener %q: %w", l.Name, err)
+		}
 		if _, ok := c.Pools[l.UpstreamPool]; !ok {
 			return fmt.Errorf("listener %q: unknown upstream_pool %q", l.Name, l.UpstreamPool)
 		}
 		if l.DialTimeout == 0 {
 			l.DialTimeout = Duration(DefaultDialTimeout)
+		} else if l.DialTimeout < 0 {
+			return fmt.Errorf("listener %q: dial_timeout cannot be negative", l.Name)
 		}
 		if l.IdleTimeout == 0 {
 			l.IdleTimeout = Duration(DefaultIdleTimeout)
+		} else if l.IdleTimeout < 0 {
+			return fmt.Errorf("listener %q: idle_timeout cannot be negative", l.Name)
 		}
 		if l.MaxConns < 0 {
 			return fmt.Errorf("listener %q: max_conns cannot be negative", l.Name)
@@ -119,6 +138,47 @@ func (c *Config) applyDefaultsAndValidate() error {
 		default:
 			return fmt.Errorf("pool %q: unknown balance %q (want round_robin or least_conn)", name, p.Balance)
 		}
+		seenServer := make(map[string]bool, len(p.Servers))
+		for _, s := range p.Servers {
+			if err := validateAddr(s, true); err != nil {
+				return fmt.Errorf("pool %q: %w", name, err)
+			}
+			if seenServer[s] {
+				return fmt.Errorf("pool %q: duplicate server %q", name, s)
+			}
+			seenServer[s] = true
+		}
+	}
+	return nil
+}
+
+// validateAddr checks that addr is a well-formed "host:port".
+//
+// When requireHost is true the host part must be present (used for upstream
+// servers); listeners may omit it to bind all interfaces (":8080"). Port 0 is
+// allowed for listeners (ephemeral port, handy in tests) but not for servers.
+// The port must be numeric; service names are rejected to keep behaviour
+// predictable.
+func validateAddr(addr string, requireHost bool) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid address %q: %w", addr, err)
+	}
+	if requireHost && host == "" {
+		return fmt.Errorf("invalid address %q: host is required", addr)
+	}
+	if port == "" {
+		return fmt.Errorf("invalid address %q: port is required", addr)
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil {
+		return fmt.Errorf("invalid address %q: port %q is not numeric", addr, port)
+	}
+	if n < 0 || n > 65535 {
+		return fmt.Errorf("invalid address %q: port %d out of range 0..65535", addr, n)
+	}
+	if requireHost && n == 0 {
+		return fmt.Errorf("invalid address %q: port 0 is not allowed for servers", addr)
 	}
 	return nil
 }

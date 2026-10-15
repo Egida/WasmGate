@@ -12,13 +12,18 @@ import (
 
 // Server binds the configured listeners and dispatches accepted connections to
 // the Proxy.
+//
+// Lifecycle: create with NewServer, call Start exactly once, then Shutdown.
+// Start is not idempotent — a second call returns an error. Shutdown closes all
+// listeners, after which Addrs reports nothing.
 type Server struct {
 	log   *slog.Logger // structured logger
 	rt    *Runtime     // source of the current snapshot
 	proxy *Proxy       // shared by all accept loops
 
-	mu sync.Mutex     // guards ln; never touched on the hot path
-	ln []net.Listener // listeners bound by Start, protected by mu
+	mu      sync.Mutex     // guards started and ln; never touched on the hot path
+	started bool           // set once Start has run
+	ln      []net.Listener // listeners bound by Start, protected by mu
 
 	wg sync.WaitGroup // accept loops plus every in-flight connection handler
 }
@@ -29,7 +34,16 @@ func NewServer(log *slog.Logger, rt *Runtime) *Server {
 }
 
 // Start binds every listener in the current snapshot and begins accepting.
+// It may be called only once per Server; a second call returns an error.
 func (s *Server) Start(ctx context.Context) error {
+	s.mu.Lock()
+	if s.started {
+		s.mu.Unlock()
+		return errors.New("proxy: Server already started")
+	}
+	s.started = true
+	s.mu.Unlock()
+
 	snap := s.rt.Load()
 
 	var lc net.ListenConfig
@@ -48,6 +62,7 @@ func (s *Server) Start(ctx context.Context) error {
 			"listener", l.Name,
 			"addr", ln.Addr().String(),
 			"pool", l.UpstreamPool,
+			"balance", snap.listeners[l.Name].pool.balancer.Name(),
 		)
 
 		s.wg.Add(1)
@@ -56,7 +71,8 @@ func (s *Server) Start(ctx context.Context) error {
 	return nil
 }
 
-// Addrs returns the bound listener addresses (useful in tests with port 0).
+// Addrs returns the currently bound listener addresses (useful in tests with
+// port 0). After Shutdown it is empty.
 func (s *Server) Addrs() []net.Addr {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -67,13 +83,14 @@ func (s *Server) Addrs() []net.Addr {
 	return addrs
 }
 
-// closeListeners closes every bound listener. Idempotent.
+// closeListeners closes every bound listener and clears the slice. Idempotent.
 func (s *Server) closeListeners() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, ln := range s.ln {
 		_ = ln.Close()
 	}
+	s.ln = nil
 }
 
 // acceptLoop accepts connections on ln until Shutdown closes the listener,

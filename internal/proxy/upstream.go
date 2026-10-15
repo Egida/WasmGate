@@ -23,13 +23,20 @@ type upstream struct {
 //
 // This is an extension point: new strategies (weighted RR, hash by client IP,
 // least-latency, ...) implement this interface without touching the data path.
+//
+// Next must be called with a non-empty server slice (guaranteed by config
+// validation), so selection itself cannot fail. When health-checks arrive, a
+// balancer may need to skip unhealthy upstreams and this may grow an error
+// return.
 type Balancer interface {
 	Next(servers []*upstream) *upstream
 	Name() string
 }
 
 // newBalancer maps a config balance value to a strategy. Anything other than
-// "least_conn" yields round-robin; config validation is the real gatekeeper.
+// "least_conn" yields round-robin. Config validation is the real gatekeeper: an
+// unknown value (e.g. "least_con") is rejected by Load long before reaching
+// here, so the default branch is only a safety net.
 func newBalancer(kind string) Balancer {
 	if kind == "least_conn" {
 		return &leastConn{}

@@ -10,8 +10,9 @@ import (
 // proxied session against an upstream.
 //
 // Extension points (added in later milestones, kept as explicit seams):
-//   - DDoS / rate limiting on the sliding window: checked right after Resolve,
-//     before dialing the upstream, so abusive connections are dropped cheaply.
+//   - DDoS / rate limiting on the sliding window: checked right after the
+//     listener is resolved, before dialing the upstream, so abusive connections
+//     are dropped cheaply.
 //   - WASM plugin hooks: on_accept / on_data / on_close, invoked around the
 //     data loop.
 type Proxy struct {
@@ -33,23 +34,33 @@ func (p *Proxy) Handle(ctx context.Context, listenerName string, client net.Conn
 
 	snap := p.rt.Load()
 
-	lc, ok := snap.Config.Listener(listenerName)
+	rl, ok := snap.listeners[listenerName]
 	if !ok {
 		p.log.Error("listener missing from snapshot", "listener", listenerName)
 		return
 	}
-	pool := snap.Pools[lc.UpstreamPool]
-	if pool == nil {
-		p.log.Error("pool missing from snapshot", "listener", listenerName, "pool", lc.UpstreamPool)
+	if rl.pool == nil {
+		p.log.Error("pool missing from snapshot", "listener", listenerName, "pool", rl.cfg.UpstreamPool)
 		return
+	}
+
+	// Enforce the per-listener connection limit (max_conns == 0 means unlimited).
+	if rl.sem != nil {
+		select {
+		case rl.sem <- struct{}{}:
+			defer func() { <-rl.sem }()
+		default:
+			p.log.Warn("connection limit reached", "listener", listenerName, "max_conns", cap(rl.sem))
+			return
+		}
 	}
 
 	// --- FUTURE: DDoS / sliding-window rate limit check goes HERE. ---
 
-	up := pool.Next()
-	defer pool.Release(up)
+	up := rl.pool.Next()
+	defer rl.pool.Release(up)
 
-	dialCtx, cancel := context.WithTimeout(ctx, lc.DialTimeout.Std())
+	dialCtx, cancel := context.WithTimeout(ctx, rl.cfg.DialTimeout.Std())
 	defer cancel()
 
 	var d net.Dialer
@@ -60,7 +71,7 @@ func (p *Proxy) Handle(ctx context.Context, listenerName string, client net.Conn
 	}
 	defer server.Close()
 
-	p.log.Debug("proxying", "listener", listenerName, "upstream", up.addr)
+	p.log.Debug("proxying", "listener", listenerName, "pool", rl.pool.Name(), "upstream", up.addr)
 
-	join(client, server)
+	join(ctx, client, server, rl.cfg.IdleTimeout.Std())
 }
