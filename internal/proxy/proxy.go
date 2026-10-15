@@ -15,8 +15,8 @@ import (
 //   - WASM plugin hooks: on_accept / on_data / on_close, invoked around the
 //     data loop.
 type Proxy struct {
-	log *slog.Logger
-	rt  *Runtime
+	log *slog.Logger // structured logger
+	rt  *Runtime     // source of the current snapshot
 }
 
 // New returns a Proxy that reads configuration from rt on every connection.

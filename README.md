@@ -29,12 +29,12 @@ CGO, профилирование и воспроизводимые замеры
 
 ## Что в ядре, а что — в расширениях
 
-| № | Фича | Статус | Где живёт |
-|---|------|--------|-----------|
-| F1 | Zero-Downtime Hot Reload + C# Control Plane | **CORE** | Control + Data plane |
-| F2 | Smart DDoS (скользящее окно) | **CORE** | Go fast path |
-| F3 | Deep Packet Inspection (zero-alloc JSON) | Extension (future work) | Требует L7-этапа |
-| F4 | eBPF-интеграция для фильтрации | Extension (future work) | Ядро Linux |
+| № | Фича | Роль | Состояние в коде |
+|---|------|------|------------------|
+| **F2** | Smart DDoS (скользящее окно) | **Ядро — первая фича** | ещё не начато (следующий шаг) |
+| **F1** | Zero-Downtime Hot Reload + C# Control Plane | Усиление | каркас готов (`atomic` snapshot); Control Plane — план |
+| **F3** | Deep Packet Inspection (zero-alloc JSON) | Future work | требует L7-этапа |
+| **F4** | eBPF-интеграция для фильтрации | Future work | только Linux |
 
 > Детальное обоснование выбора — в [`docs/04-diploma-features.md`](docs/04-diploma-features.md).
 
@@ -49,13 +49,15 @@ CGO, профилирование и воспроизводимые замеры
 | [`docs/03-mvp.md`](docs/03-mvp.md) | MVP (L4 TCP), скоуп, DoD, **методика замеров baseline** | Гл. 3–4 (реализация/оценка) |
 | [`docs/04-diploma-features.md`](docs/04-diploma-features.md) | Разбор 4 фич, матрица impact/effort, выбор ядра | Обоснование новизны |
 | [`docs/05-roadmap-thesis.md`](docs/05-roadmap-thesis.md) | План работ, milestones, структура ВКР, артефакты защиты | Планирование |
+| [`docs/07-glossary.md`](docs/07-glossary.md) | Глоссарий терминов (L4, splice, RCU, WASM, sliding window…) | Памятка |
+| [`DEVELOPMENT.md`](DEVELOPMENT.md) | Команды, структура кода, рецепты «как добавить X» | Ежедневная работа |
 
 ---
 
 ## Технологический стек (кратко)
 
-- **Data Plane:** Go 1.2x, [`gnet`](https://github.com/panjf2000/gnet) (event-loop,
-  epoll/kqueue/IOCP), zero-copy `splice` на Linux.
+- **Data Plane:** Go 1.23+, стандартный `net` (горутина на соединение, epoll под
+  капотом), zero-copy `splice(2)` на Linux. `gnet` — опциональная оптимизация.
 - **Plugin Runtime:** [`wazero`](https://github.com/tetratelabs/wazero) — WebAssembly
   рантайм на чистом Go, **без CGO**, sandbox по памяти/CPU/времени.
 - **Control Plane:** C#/.NET 8, ASP.NET Core + **gRPC** (UDS) для управления.
@@ -75,7 +77,7 @@ CGO, профилирование и воспроизводимые замеры
                                             ▼
    clients ─────────▶  ┌──────────────────────────────────────────────────────────────┐
                        │                 Data Plane (Go, fast path)                    │
-                       │  gnet event-loop → TLS/SNI peek → DDoS sliding window →        │
+                       │  net accept-loop → TLS/SNI peek → DDoS sliding window →        │
                        │  routing/balancer → upstream pool → WASM hooks (wazero)       │
                        │  atomic.Pointer[Config]  ⇒  HOT RELOAD без рестарта            │
                        └───────────────────────────────┬──────────────────────────────┘
@@ -92,6 +94,7 @@ CGO, профилирование и воспроизводимые замеры
 3. [`03-mvp.md`](docs/03-mvp.md) — *что делаем первым* и *как меряем*.
 4. [`04-diploma-features.md`](docs/04-diploma-features.md) — *чем отличаемся* и *почему*.
 5. [`05-roadmap-thesis.md`](docs/05-roadmap-thesis.md) — *план и структура диплома*.
+6. [`DEVELOPMENT.md`](DEVELOPMENT.md) — *как работать с кодом и командами*.
 
 ---
 
@@ -132,14 +135,6 @@ docs/                проектная документация (Obsidian-со�
 - `internal/proxy/proxy.go` — точка вставки **DDoS/rate-limit** (перед dial) и
   **WASM-хуков** (`on_accept`/`on_data`/`on_close`).
 - `internal/proxy/upstream.go` — интерфейс **`Balancer`** для новых стратегий.
-
-### Замечание по подходу (важно)
-
-В `docs/02` стек называл `gnet` как L4-движок. **На практике MVP стартует на
-стандартном `net` + горутина-на-соединение.** Причины: `io.Copy` на Linux уже
-использует `splice(2)` (zero-copy), backpressure и per-conn состояние бесплатны,
-а код заметно проще. `gnet` оставляем как **оптимизацию после замеров**, если
-ядро окажется узким — это согласуется с принципом «сначала baseline».
 
 ### Учтено по «граблям»
 

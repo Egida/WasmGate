@@ -6,21 +6,40 @@
 
 ---
 
+## Текущий статус и следующий шаг
+
+**Реализовано (M0/M1 + каркас M2):** L4 TCP reverse proxy на `net` — приём
+соединений, балансировка `round_robin`/`least_conn`, проксирование
+(`io.Copy` → `splice` на Linux), `dial_timeout`, half-close, graceful drain,
+reload конфига по SIGHUP через атомарный snapshot, структурные логи, сборка без
+CGO. Покрыто тестами (`go test ./...`).
+
+**Ещё не реализовано:** DDoS/rate-limit, WASM-плагины, SNI/TLS-peek, health-checks,
+метрики/pprof, CLI, нагрузочные бенчмарки. Куда встраивать — §10 «Рецепты».
+
+**Следующий шаг:** пакет `internal/ratelimit` (DDoS на скользящем окне — первая
+фича ядра). Чек-лист и точка вставки — §10.3; в коде это метка `FUTURE` в
+`internal/proxy/proxy.go`.
+
+**Milestones:** M0 ✅ · M1 ✅ · M2 🟡 (каркас) · M3 ⏳ · M4–M6 ⏳ (см. `docs/05`).
+
+---
+
 ## 0. Шпаргалка команд
 
-| Задача | Команда |
-|--------|---------|
-| Собрать | `go build -o bin/wasmgate.exe ./cmd/wasmgate` |
-| Запустить без сборки | `go run ./cmd/wasmgate -config configs/wasmgate.yaml` |
-| Все тесты | `go test ./...` |
-| Тесты без кэша | `go test -count=1 ./...` |
-| Покрытие | `go test -cover ./...` |
-| Тесты с гонками | `go test -race ./...` *(нужен CGO + C-компилятор)* |
-| Бенчмарки | `go test -run '^$' -bench . -benchmem ./...` |
-| Форматирование | `gofmt -l .` (проверить) / `gofmt -w .` (исправить) |
-| Статический анализ | `go vet ./...` |
-| Линтер | `golangci-lint run` |
-| Зависимости | `go mod tidy` |
+| Задача               | Команда                                                                                                  |
+| -------------------- | -------------------------------------------------------------------------------------------------------- |
+| Собрать              | `go build -o bin/wasmgate.exe ./cmd/wasmgate`                                                            |
+| Запустить без сборки | `go run ./cmd/wasmgate -config configs/wasmgate.yaml`                                                    |
+| Все тесты            | `go test ./...`                                                                                          |
+| Тесты без кэша       | `go test -count=1 ./...`                                                                                 |
+| Покрытие             | `go test -cover ./...`                                                                                   |
+| Тесты с гонками      | `go test -race ./...` *(нужен CGO + C-компилятор)*                                                       |
+| Бенчмарки            | `go test -run '^$' -bench . -benchmem ./...`                                                             |
+| Форматирование       | `gofmt -l .` (проверить) / `gofmt -w .` (исправить)                                                      |
+| Статический анализ   | `go vet ./...`                                                                                           |
+| Линтер               | `golangci-lint run`                                                                                      |
+| Зависимости          | `go mod tidy`                                                                                            |
 | Кросс-сборка (Linux) | `$env:CGO_ENABLED=0;$env:GOOS="linux";$env:GOARCH="amd64";go build -o bin/wasmgate-linux ./cmd/wasmgate` |
 
 > В репозитории есть `Makefile` (`make build`, `make test`, `make bench`, …), но
@@ -56,6 +75,7 @@ WasmGate/
 │   │   ├── duration.go      тип Duration (парсит "3s" из YAML)
 │   │   └── config_test.go   тесты загрузки/валидации
 │   ├── proxy/               ← СЕРДЦЕ data plane
+│   │   ├── doc.go           обзор пакета (архитектура, швы расширения)
 │   │   ├── server.go        Server: листенеры, accept-loop, graceful shutdown
 │   │   ├── proxy.go         Proxy.Handle: обработка одного соединения
 │   │   ├── pool.go          Pool: upstream'ы + балансировщик
@@ -69,7 +89,7 @@ WasmGate/
 │   ├── wasmgate.yaml        основной пример
 │   └── local-echo.yaml      конфиг для smoke-теста (см. §5)
 ├── plugins/ benchmarks/ deployments/   заглушки под будущие milestone'ы
-├── docs/                    01–05: проектная документация (Obsidian)
+├── docs/                    01–07: проектная документация (Obsidian)
 ├── go.mod / go.sum
 ├── Makefile / .golangci.yml / .gitignore
 └── README.md / DEVELOPMENT.md
@@ -402,4 +422,6 @@ pools:
 
 - Проектная логика и обоснование — [`docs/`](docs/), особенно `docs/03-mvp.md`
   (методика замеров) и `docs/02-architecture-tech.md` (стек, кодстайл, ADR).
+- Незнакомый термин — [`docs/07-glossary.md`](docs/07-glossary.md).
+- Пакет `internal/proxy` целиком описан в `internal/proxy/doc.go`.
 - Точки расширения помечены в коде комментариями `FUTURE` / `TODO`.

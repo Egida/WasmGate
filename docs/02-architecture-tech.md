@@ -36,12 +36,12 @@
                                              ▼
 ┌──────────────────────────────── DATA PLANE (Go, pure) ─────────────────────────────────┐
 │  ┌───────────────┐                                                                     │
-│  │  gnet loop(s) │  accept → SNI peek → DDoS (sliding window) → route/balance →        │
-│  │  (epoll/… )   │  upstream dial → bidirectional copy/splice → WASM hooks → close     │
+│  │  accept loop  │  accept → SNI peek → DDoS (sliding window) → route/balance →        │
+│  │  net + splice │  upstream dial → bidirectional copy/splice → WASM hooks → close     │
 │  └───────┬───────┘                                                                     │
 │          │  читают через  atomic.Pointer[Snapshot]  (RCU, без блокировок)              │
 │  ┌───────▼────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────────┐  ┌─────────┐ │
-│  │ config	snapshot│  │ ratelimit    │  │ plugin host  │  │ metrics/logs  │  │ TLS     │ │
+│  │ config snapshot│  │ ratelimit    │  │ plugin host  │  │ metrics/logs  │  │ TLS     │ │
 │  │ (immutable)    │  │ (ring window)│  │ (wazero)     │  │ (prom/otel)   │  │ (peek)  │ │
 │  └────────────────┘  └──────────────┘  └──────────────┘  └───────────────┘  └─────────┘ │
 └──────────────────────────────────────────┬─────────────────────────────────────────────┘
@@ -92,7 +92,7 @@ accept()
 
 | Слой | Выбор | Почему | Альтернативы (и почему нет) |
 |------|-------|--------|------------------------------|
-| Networking (L4) | **`panjf2000/gnet`** | Event-loop, epoll/kqueue/IOCP, `SO_REUSEPORT`, минимальные аллокации | `net` (больше горутин/аллокаций), `fasthttp` (это HTTP), `valyala/gozstd` не то |
+| Networking (L4) | **стандартный `net`** (горутина на соединение) | Просто и предсказуемо; backpressure и per-conn состояние «из коробки»; под капотом epoll; `io.Copy` использует `splice(2)` | `gnet` (event-loop) — опция для миллионов лёгких соединений, но добавляет сложность; `fasthttp` — это HTTP |
 | Zero-copy | `splice` (Linux) через `net.TCPConn.ReadFrom` | Копирование данных в ядре, а не в user-space | ручные `io.Copy` (медленнее) |
 | WASM runtime | **`tetratelabs/wazero`** | Чистый Go, **нет CGO**, быстрый старт, sandbox, WASI | `wasmtime-go` (CGO), `wasmer-go` (CGO, тяжелее) |
 | JSON (future DPI) | `valyala/fastjson` / `bytedance/sonic` | Zero/низкие аллокации, SIMD (sonic) | `encoding/json` (рефлексия, аллокации) |
@@ -142,26 +142,25 @@ linters:
 ### 5.2. Раскладка проекта (standard layout)
 
 ```
-wasmgate/
-├── cmd/
-│   ├── wasmgate/           # бинарь data plane
-│   └── wasmgate-ctl/       # CLI управления
+wasmgate/                         # ← фактическая структура репозитория
+├── cmd/wasmgate/                 # бинарь data plane (+ signals_unix/windows.go)
 ├── internal/
-│   ├── dataplane/          # gnet event-loop, connection handler
-│   ├── proxy/              # upstream pool, балансировка, splice
-│   ├── config/             # схема, загрузчик, Snapshot, atomic swap
-│   ├── ratelimit/          # sliding window DDoS
-│   ├── plugin/             # wazero host, ABI, контракты, лимиты
-│   ├── tlspeek/            # SNI peek, passthrough/terminate
-│   ├── observe/            # metrics, logs, tracing, pprof
-│   └── control/            # gRPC-клиент к control plane
-├── pkg/api/                # сгенерированный protobuf (общий контракт)
-├── plugins/examples/       # примеры плагинов: rust, csharp, tinygo
-├── benchmarks/             # скрипты нагрузки (wrk2, k6, vegeta)
-├── deployments/            # Dockerfile, compose, systemd
-├── docs/                   # эти документы
-├── go.mod
-└── .golangci.yml
+│   ├── config/                   # схема YAML, Load(), Duration, валидация
+│   ├── proxy/                    # data plane: server, proxy, pool, upstream, copy, snapshot
+│   └── observe/                  # логирование (log/slog)
+├── configs/                      # примеры конфигурации (wasmgate.yaml, local-echo.yaml)
+├── plugins/examples/             # (future) примеры плагинов: rust, csharp, tinygo
+├── benchmarks/                   # (future) скрипты нагрузки (wrk2, k6, vegeta)
+├── deployments/                  # (future) Dockerfile, compose, systemd
+├── docs/                         # проектная документация
+├── README.md / DEVELOPMENT.md
+├── go.mod / .golangci.yml / Makefile
+└── (future)
+    ├── internal/ratelimit/       # sliding window DDoS  ← первая фича ядра
+    ├── internal/plugin/          # wazero host, ABI, контракты, лимиты
+    ├── internal/tlspeek/         # SNI peek, passthrough/terminate
+    ├── internal/control/         # gRPC-клиент к control plane
+    └── pkg/api/                  # сгенерированный protobuf (общий контракт)
 ```
 
 > Control Plane (C#) — **отдельный репозиторий/решение** `wasmgate-control`
@@ -255,26 +254,29 @@ if err := dialUpstream(ctx, addr); err != nil {
 замена указателя. Читатели (обработчики соединений) не блокируются никогда.
 
 ```go
-// internal/config/snapshot.go
+// internal/proxy/snapshot.go — текущая (упрощённая) реализация
 type Snapshot struct {
     Version uint64
-    Routes  RouteTable      // маршруты → upstream-пулы
-    Limits  LimitPolicy     // политики DDoS/лимитов
-    Plugins PluginSet       // активные версии WASM-плагинов
+    Config  *config.Config     // листенеры + пулы (данные из YAML)
+    Pools   map[string]*Pool   // скомпилированные пулы + живые счётчики
 }
 
 type Runtime struct{ cur atomic.Pointer[Snapshot] }
 
+// Load — один атомарный load; вызывается на КАЖДОМ соединении.
 func (r *Runtime) Load() *Snapshot { return r.cur.Load() }
 
-// Apply вызывается Control Plane'ом; публикация атомарна.
-func (r *Runtime) Apply(next *Snapshot) (ver uint64) {
-    prev := r.cur.Load()
-    next.Version = prev.Version + 1
-    r.cur.Store(next) // RCU: старые читатели держат prev, новые видят next
+// Reload строит новый снапшот и публикует его (вызывает SIGHUP / Control Plane).
+func (r *Runtime) Reload(cfg *config.Config) uint64 {
+    next := buildSnapshot(r.cur.Load().Version+1, cfg)
+    r.cur.Store(next) // RCU: старые читатели держат прошлый, новые видят новый
     return next.Version
 }
 ```
+
+> Целевая (более богатая) форма `Snapshot` добавит `Routes` (маршруты по SNI),
+> `Limits` (политики DDoS) и `Plugins` (активные версии WASM). Сейчас там только
+> `Config` + `Pools`, но механизм ровно тот же.
 
 **Drain-политика:**
 
@@ -338,12 +340,12 @@ type Window struct {
 
 | ID | Решение | Альтернативы | Обоснование | Статус |
 |----|---------|--------------|-------------|--------|
-| ADR-1 | gnet как L4-движок | `net`, `fasthttp` | event-loop, reuseport, минимум аллокаций | Accepted |
+| ADR-1 | **`net`** (горутина на соединение) как L4-движок | `gnet`, `fasthttp` | прост, `splice`/backpressure бесплатны, достаточно быстр; `gnet` — опция после замеров | Accepted (было: gnet) |
 | ADR-2 | wazero как WASM-рантайм | wasmtime/wasmer | чистый Go, **нет CGO**, быстро, sandbox | Accepted |
 | ADR-3 | Snapshot + `atomic.Pointer` для reload | double-buffer с мьютексом | non-blocking RCU, 0 разрывов | Accepted |
 | ADR-4 | C# control plane + gRPC/UDS | REST, файл+watch, Go control plane | строгий контракт, быстрый локальный канал | Accepted |
 | ADR-5 | Стек стартует как **L4 (TCP)** | сразу L7 HTTP | быстрее получить baseline-перф | Accepted |
-| ADR-6 | DPI JSON и eBPF — future work | в первом релизе | фокус на ядре (reload + DDoS) | Proposed |
+| ADR-6 | В ядро первой волной — **DDoS sliding window**; Hot Reload-каркас уже заложен; DPI JSON и eBPF — future work | всё сразу | фокус и измеримость | Accepted |
 
 ---
 

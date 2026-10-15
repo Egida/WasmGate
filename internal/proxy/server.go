@@ -13,14 +13,14 @@ import (
 // Server binds the configured listeners and dispatches accepted connections to
 // the Proxy.
 type Server struct {
-	log   *slog.Logger
-	rt    *Runtime
-	proxy *Proxy
+	log   *slog.Logger // structured logger
+	rt    *Runtime     // source of the current snapshot
+	proxy *Proxy       // shared by all accept loops
 
-	mu sync.Mutex
-	ln []net.Listener
+	mu sync.Mutex     // guards ln; never touched on the hot path
+	ln []net.Listener // listeners bound by Start, protected by mu
 
-	wg sync.WaitGroup
+	wg sync.WaitGroup // accept loops plus every in-flight connection handler
 }
 
 // NewServer builds a Server bound to the runtime rt.
@@ -76,6 +76,9 @@ func (s *Server) closeListeners() {
 	}
 }
 
+// acceptLoop accepts connections on ln until Shutdown closes the listener,
+// handing each connection to its own goroutine. Every accepted connection is
+// tracked by s.wg so Shutdown can wait for the drain to finish.
 func (s *Server) acceptLoop(ctx context.Context, name string, ln net.Listener) {
 	defer s.wg.Done()
 

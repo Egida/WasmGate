@@ -20,19 +20,19 @@ const (
 
 // Config is the root of the configuration file.
 type Config struct {
-	Version   int                   `yaml:"version"`
-	Listeners []ListenerConfig      `yaml:"listeners"`
-	Pools     map[string]PoolConfig `yaml:"pools"`
+	Version   int                   `yaml:"version"`   // schema version (informational)
+	Listeners []ListenerConfig      `yaml:"listeners"` // front-facing TCP listeners
+	Pools     map[string]PoolConfig `yaml:"pools"`     // backend groups, keyed by pool name
 }
 
 // ListenerConfig describes a single front-facing TCP listener.
 type ListenerConfig struct {
-	Name         string   `yaml:"name"`
-	Addr         string   `yaml:"addr"`
-	UpstreamPool string   `yaml:"upstream_pool"`
-	MaxConns     int      `yaml:"max_conns"`
-	DialTimeout  Duration `yaml:"dial_timeout"`
-	IdleTimeout  Duration `yaml:"idle_timeout"`
+	Name         string   `yaml:"name"`          // unique name (used for logs and lookup)
+	Addr         string   `yaml:"addr"`          // listen address, e.g. "127.0.0.1:8080"
+	UpstreamPool string   `yaml:"upstream_pool"` // name of the target pool in Config.Pools
+	MaxConns     int      `yaml:"max_conns"`     // RESERVED (M2): not enforced yet
+	DialTimeout  Duration `yaml:"dial_timeout"`  // upstream dial timeout (default 5s)
+	IdleTimeout  Duration `yaml:"idle_timeout"`  // RESERVED (M2): not enforced yet (default 60s)
 }
 
 // PoolConfig describes a group of backend endpoints.
@@ -72,6 +72,10 @@ func (c *Config) Listener(name string) (ListenerConfig, bool) {
 	return ListenerConfig{}, false
 }
 
+// applyDefaultsAndValidate fills in default timeouts and rejects invalid
+// configurations: missing or duplicate listener names, unknown pool references,
+// negative connection limits, empty pools and unknown balance strategies. It
+// mutates c in place and is called by Load.
 func (c *Config) applyDefaultsAndValidate() error {
 	if len(c.Listeners) == 0 {
 		return fmt.Errorf("config: no listeners defined")

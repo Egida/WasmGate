@@ -24,6 +24,9 @@ func main() {
 	}
 }
 
+// run wires the graph (config -> runtime -> server), starts accepting and then
+// blocks until a shutdown signal arrives. On Unix, SIGHUP reloads the config
+// without dropping connections; the returned error is reported by main.
 func run() error {
 	var (
 		configPath    = flag.String("config", "configs/wasmgate.yaml", "path to the configuration file")

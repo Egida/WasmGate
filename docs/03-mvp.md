@@ -25,18 +25,18 @@
 
 ### 2.1. Входит (IN)
 
-| # | Возможность |
-|---|-------------|
-| 1 | Приём TCP-соединений (event-loop `gnet`, `SO_REUSEPORT`, multi-core) |
-| 2 | Проксирование на upstream-пул (bidirectional copy, `splice` на Linux) |
-| 3 | Балансировка: round-robin / least-conn |
-| 4 | Таймауты: connect / idle / total; лимиты соединений |
-| 5 | **TLS passthrough** через SNI-peek (без терминации); опц. терминация |
-| 6 | Health-checks (активный TCP-connect + пассивный по ошибкам) |
-| 7 | Конфиг из YAML + базовая **hot reload** (SIGHUP / watch — прообраз RCU) |
-| 8 | Наблюдаемость: Prometheus-метрики, структурные логи (`zerolog`), `pprof` |
-| 9 | Graceful shutdown & **drain** (перестаём принимать, доигрываем активные) |
-| 10 | CLI `wasmgate-ctl` (валидация/применение конфига) |
+| # | Возможность | Статус |
+|---|-------------|--------|
+| 1 | Приём TCP-соединений (`net`, горутина на соединение; epoll под капотом) | ✅ M0 |
+| 2 | Проксирование на upstream-пул (bidirectional copy, `splice` на Linux) | ✅ M1 |
+| 3 | Балансировка: round-robin / least-conn | ✅ M1 |
+| 4 | Таймауты: connect (есть), idle (M2); лимит `max_conns` (M2) | 🟡 частично |
+| 5 | **TLS passthrough** через SNI-peek (без терминации); опц. терминация | ⏳ план |
+| 6 | Health-checks (активный TCP-connect + пассивный по ошибкам) | ⏳ план |
+| 7 | Конфиг из YAML + **hot reload** (SIGHUP — прообраз RCU) | ✅ M2 (каркас) |
+| 8 | Наблюдаемость: структурные логи (`log/slog`) есть; метрики/`pprof` — M3 | 🟡 частично |
+| 9 | Graceful shutdown & **drain** (перестаём принимать, доигрываем активные) | ✅ M2 |
+| 10 | CLI `wasmgate-ctl` (валидация/применение конфига) | ⏳ план |
 
 ### 2.2. Не входит (OUT — в следующей волне)
 
@@ -70,25 +70,21 @@
 ## 4. Архитектура MVP (упрощённо)
 
 ```
-clients ─▶ gnet loop ─▶ route(SNI/host) ─▶ balancer ─▶ upstream pool ─▶ copy/splice
-                │                                     ▲
+clients ─▶ accept-loop ─▶ balancer ─▶ upstream pool ─▶ copy/splice
+                │                            ▲
                 └── snapshot (atomic) ◀── config loader ┘
                         ▲
-                   SIGHUP / file watch
-                        ▲
-                   wasmgate-ctl (CLI)
+                   SIGHUP / file watch / Control Plane (позже)
 ```
 
-Модули MVP:
+Модули MVP (фактическая структура; `proxy` — это и есть data plane):
 
 ```
 internal/
-├── dataplane/   # gnet: OnOpen/OnClose, буферы, лимиты
-├── proxy/       # pool, balancer (RR/least-conn), copy/splice, таймауты
-├── config/      # схема YAML, загрузчик, Snapshot, atomic swap
-├── tlspeek/     # парсинг ClientHello → SNI
-├── observe/     # metrics(prom), logs(zerolog), pprof
-└── control/     # интерфейс применения (в MVP — локальный)
+├── proxy/       # server, proxy.Handle, pool, balancer, copy/splice, snapshot (RCU)
+├── config/      # схема YAML, загрузчик, Duration, валидация (чистые данные)
+└── observe/     # логирование (log/slog); метрики/pprof — M3
+# future: ratelimit/ (DDoS), plugin/ (wazero), tlspeek/ (SNI), control/ (gRPC)
 ```
 
 ---
@@ -129,16 +125,21 @@ upstream_pools:
 
 Смена конфига → новый `Snapshot` → `atomic.Store` (прообраз Hot Reload).
 
+> **Важно:** пример выше — **целевая** схема (с `routes`, `tls`, `health_check`).
+> Текущая реализация поддерживает подмножество (`listeners` + `pools`) — живой
+> пример см. в [`configs/wasmgate.yaml`](../configs/wasmgate.yaml). Остальные поля
+> включаются по мере реализации фич.
+
 ---
 
 ## 6. Этапы (milestones)
 
 | Milestone | Содержание | Deliverable | DoD |
 |-----------|------------|-------------|-----|
-| **M0. Skeleton** | gnet-цикл, буферы, лимиты, логирование | Бинарь принимает соединения | `go test -race` зелёный |
-| **M1. Proxy core** | пулы, балансировка, copy/splice, таймауты | Проксирует TCP end-to-end | `goroutine leak` тест зелёный |
-| **M2. Config+reload+drain** | YAML, Snapshot, atomic swap, SIGHUP, drain | Reload без разрыва соединений | chaos-тест reload = 0 dropped |
-| **M3. Observe+hardening** | метрики, pprof, health-checks, CLI | Наблюдаемый прокси | baseline-замеры сняты |
+| **M0. Skeleton** | accept-loop (`net`), логирование, каркас | Бинарь принимает соединения | ✅ done |
+| **M1. Proxy core** | пулы, балансировка, copy/splice, таймауты | Проксирует TCP end-to-end | ✅ done |
+| **M2. Config+reload+drain** | YAML, Snapshot, atomic swap, SIGHUP, drain | Reload без разрыва соединений | 🟡 каркас готов |
+| **M3. Observe+hardening** | метрики, pprof, health-checks, CLI | Наблюдаемый прокси | ⏳ baseline |
 
 > **После M3** — ядровые фичи: DDoS sliding window (F2), затем WASM host +
 > C# Control Plane (F1); DPI (F3) и eBPF (F4) — future work.
@@ -242,7 +243,7 @@ go tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30
 
 | Риск | Вероятность | Влияние | Митигация |
 |------|-------------|---------|-----------|
-| gnet API не даёт нужного контроля (per-conn состояние) | Средняя | Среднее | Прототип в M0; fallback на `net`+`splice` |
+| Движок event-loop (`gnet`) добавляет сложность, если взять его преждевременно | Средняя | Среднее | Решено: старт на `net`+`splice`; `gnet` — только если замеры покажут узкое место |
 | Drain/reload рвёт соединения на гонках | Средняя | Высокое | Chaos-тест + race; фиксировать snapshot per-conn |
 | `splice` не кросс-платформенный | Высокая | Низкое | Linux — fast path; иначе `io.Copy` |
 | Baseline «загрязнён» окружением | Средняя | Среднее | pinning, netns, ≥5 прогонов, benchstat |

@@ -28,6 +28,8 @@ type Balancer interface {
 	Name() string
 }
 
+// newBalancer maps a config balance value to a strategy. Anything other than
+// "least_conn" yields round-robin; config validation is the real gatekeeper.
 func newBalancer(kind string) Balancer {
 	if kind == "least_conn" {
 		return &leastConn{}
@@ -40,8 +42,11 @@ type roundRobin struct {
 	next atomic.Uint64
 }
 
+// Name identifies the strategy (see Balancer).
 func (b *roundRobin) Name() string { return "round_robin" }
 
+// Next advances the cursor and returns servers[cursor % len]. The modulo keeps
+// it correct even across a reload that changes the server count.
 func (b *roundRobin) Next(servers []*upstream) *upstream {
 	i := b.next.Add(1) - 1
 	return servers[i%uint64(len(servers))]
@@ -50,8 +55,11 @@ func (b *roundRobin) Next(servers []*upstream) *upstream {
 // leastConn picks the upstream with the fewest active connections.
 type leastConn struct{}
 
+// Name identifies the strategy (see Balancer).
 func (b *leastConn) Name() string { return "least_conn" }
 
+// Next returns the upstream with the smallest active count; ties go to the
+// first in config order. O(n) per pick, which is fine for the pool sizes here.
 func (b *leastConn) Next(servers []*upstream) *upstream {
 	best := servers[0]
 	bestActive := best.active.Load()

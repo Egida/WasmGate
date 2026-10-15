@@ -13,9 +13,9 @@ import (
 // Pools inside carry live counters, but the map and the pool set are frozen —
 // this is what makes lock-free reads safe.
 type Snapshot struct {
-	Version uint64
-	Config  *config.Config
-	Pools   map[string]*Pool
+	Version uint64           // monotonic; bumped on every Reload
+	Config  *config.Config   // validated configuration data (no live state)
+	Pools   map[string]*Pool // compiled pools, keyed by pool name
 }
 
 // Runtime publishes Snapshots atomically.
@@ -49,6 +49,10 @@ func (r *Runtime) Reload(cfg *config.Config) uint64 {
 	return next.Version
 }
 
+// buildSnapshot compiles cfg into a ready-to-use Snapshot: it turns every
+// configured pool into a live Pool (upstreams + balancer) and tags the result
+// with the given version. All allocation happens here, up front, so the data
+// path only ever reads.
 func buildSnapshot(version uint64, cfg *config.Config) *Snapshot {
 	pools := make(map[string]*Pool, len(cfg.Pools))
 	for name, pc := range cfg.Pools {

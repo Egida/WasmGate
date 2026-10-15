@@ -27,6 +27,8 @@ func join(a, b net.Conn) {
 	wg.Wait()
 }
 
+// pipe copies src -> dst until EOF and then half-closes dst's write side. It is
+// the building block of join and signals completion through wg.
 func pipe(wg *sync.WaitGroup, dst, src net.Conn) {
 	defer wg.Done()
 	_, _ = io.Copy(dst, src)

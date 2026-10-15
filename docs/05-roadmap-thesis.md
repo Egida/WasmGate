@@ -12,10 +12,10 @@
 
 | Спринт | Тема | Задачи | Deliverable |
 |--------|------|--------|-------------|
-| **S1** | Skeleton | gnet event-loop, буферы, лимиты, zero-alloc каркас, CI + линт | Приём соединений, `-race` зелёный |
-| **S2** | Proxy core | upstream pool, балансировка, copy/splice, таймауты | TCP-прокси end-to-end |
-| **S3** | Config + reload + drain | YAML, `Snapshot`, `atomic.Pointer`, SIGHUP/watch, graceful drain | Reload без разрыва |
-| **S4** | Observe + hardening | метрики, логи, pprof, health-checks, CLI | **Baseline-замеры (M3)** |
+| **S1** | Skeleton ✅ | accept-loop (`net`), логирование, zero-alloc каркас, CI + линт | Приём соединений, `-race` зелёный |
+| **S2** | Proxy core ✅ | upstream pool, балансировка, copy/splice, таймауты | TCP-прокси end-to-end |
+| **S3** | Config + reload + drain 🟡 | YAML, `Snapshot`, `atomic.Pointer`, SIGHUP, graceful drain | Reload без разрыва (каркас готов) |
+| **S4** | Observe + hardening ⏳ | метрики, логи, pprof, health-checks, CLI | **Baseline-замеры (M3)** |
 | **S5** | **F2 DDoS** | sliding window, шардированные ключи, throttle/deny, /24-агрегация | Фильтр в fast path + замеры |
 | **S6** | **WASM host** | wazero, ABI, host functions, sandbox-лимиты, SDK-примеры | Плагин на любом языке работает |
 | **S7** | **F1 Control Plane** | C#/.NET + gRPC/UDS, версии, валидация, rollback, аудит | Hot-reload из CP без простоя |
@@ -32,13 +32,13 @@
 
 | Milestone | Критерий перехода (gate) |
 |-----------|--------------------------|
-| **M0** Skeleton | приём соединений, 0 alloc в idle, `-race` зелёный |
-| **M1** Proxy core | TCP end-to-end, нет утечек горутин |
-| **M2** Reload | 0 dropped соединений под reload (chaos-тест) |
-| **M3** Baseline | числа S0–S5 сняты и задокументированы (`benchstat`) |
-| **M4** DDoS (F2) | купирование атаки, ≤5 % throughput-регресс |
-| **M5** WASM | плагин на ≥2 языках, sandbox-лимиты работают |
-| **M6** Hot Reload CP (F1) | apply/rollback из C# без разрыва, < 100 мс |
+| **M0** Skeleton | приём соединений, 0 alloc в idle, `-race` зелёный — ✅ |
+| **M1** Proxy core | TCP end-to-end, нет утечек горутин — ✅ |
+| **M2** Reload | 0 dropped соединений под reload (chaos-тест) — 🟡 каркас |
+| **M3** Baseline | числа S0–S5 сняты и задокументированы (`benchstat`) — ⏳ |
+| **M4** DDoS (F2) | купирование атаки, ≤5 % throughput-регресс — ⏳ |
+| **M5** WASM | плагин на ≥2 языках, sandbox-лимиты работают — ⏳ |
+| **M6** Hot Reload CP (F1) | apply/rollback из C# без разрыва, < 100 мс — ⏳ |
 
 ---
 
@@ -47,7 +47,7 @@
 | Риск | P | I | Митигация |
 |------|---|---|-----------|
 | Не хватает времени на F3/F4 | Высокая | Среднее | Заранее вынести в «future work» |
-| gnet не покрывает нужный контроль per-conn | Средняя | Среднее | Прототип в S1; fallback `net`+`splice` |
+| Движок event-loop (`gnet`) преждевременно усложняет ядро | Средняя | Среднее | Старт на `net`+`splice`; `gnet` — только по результатам замеров |
 | Оверхед WASM выше ожиданий | Средняя | Высокое | Кэш инстансов, компилированный режим wazero, budget |
 | Reload ловит гонки на drain | Средняя | Высокое | Snapshot-per-conn, race, chaos |
 | Замеры «шумят» | Средняя | Среднее | pinning, netns, ≥5 прогонов, benchstat |
@@ -69,7 +69,7 @@
 
 ГЛАВА 2. ПРОЕКТИРОВАНИЕ
   2.1. Архитектура решения (Data/Control Plane, plugin host).
-  2.2. Выбор технологий и библиотек (Go, gnet, wazero, .NET, gRPC).   ← см. 02
+  2.2. Выбор технологий и библиотек (Go, `net`, wazero, .NET, gRPC).   ← см. 02
   2.3. Модель конфигурации и механизм Zero-Downtime Hot Reload (RCU/Snapshot).
   2.4. Модель защиты от DDoS на скользящем окне.
   2.5. Подсистема WASM-плагинов: ABI, sandbox, контракты.
@@ -131,10 +131,11 @@
 
 ## 7. Быстрый чек-лист автора
 
-- [ ] Проблема и гипотезы — `01-problem.md`.
-- [ ] Архитектура/стек/кодстайл/ADR — `02-architecture-tech.md`.
-- [ ] MVP + методика замеров — `03-mvp.md`.
-- [ ] Выбор ядровых фич + обоснование — `04-diploma-features.md`.
-- [ ] План/структура ВКР — `05-roadmap-thesis.md` (этот файл).
+- [x] Проблема и гипотезы — `01-problem.md`.
+- [x] Архитектура/стек/кодстайл/ADR — `02-architecture-tech.md`.
+- [x] MVP + методика замеров — `03-mvp.md`.
+- [x] Выбор ядровых фич + обоснование — `04-diploma-features.md`.
+- [x] План/структура ВКР — `05-roadmap-thesis.md` (этот файл).
+- [x] Рабочий код: M0/M1 + каркас M2 — см. [`DEVELOPMENT.md`](../DEVELOPMENT.md).
 - [ ] Baseline снят и задокументирован (M3).
 - [ ] Демо reload / plugin / DDoS готовы (M4–M6).
