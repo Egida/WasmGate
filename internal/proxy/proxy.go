@@ -60,7 +60,7 @@ func (p *Proxy) Handle(ctx context.Context, listenerName string, client net.Conn
 	up := rl.pool.Next()
 	defer rl.pool.Release(up)
 
-	dialCtx, cancel := context.WithTimeout(ctx, rl.cfg.DialTimeout.Std())
+	dialCtx, cancel := context.WithTimeout(ctx, rl.cfg.DialTimeout)
 	defer cancel()
 
 	var d net.Dialer
@@ -73,5 +73,5 @@ func (p *Proxy) Handle(ctx context.Context, listenerName string, client net.Conn
 
 	p.log.Debug("proxying", "listener", listenerName, "pool", rl.pool.Name(), "upstream", up.addr)
 
-	join(ctx, client, server, rl.cfg.IdleTimeout.Std())
+	join(ctx, client, server, rl.cfg.IdleTimeout)
 }

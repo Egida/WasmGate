@@ -5,58 +5,23 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"strconv"
-	"time"
 
 	"gopkg.in/yaml.v3"
 )
 
-// Defaults and schema constants.
-const (
-	// DefaultDialTimeout is the upstream dial timeout used when a listener
-	// omits dial_timeout.
-	DefaultDialTimeout = 5 * time.Second
-
-	// DefaultIdleTimeout is the per-direction idle timeout used when a listener
-	// omits idle_timeout.
-	//
-	// NOTE: an idle timeout is enforced on a buffered copy path, which disables
-	// the zero-copy splice(2) fast path. Keep the default at 0 (disabled) to
-	// preserve zero-copy by default; set idle_timeout explicitly in production
-	// to reap half-open connections.
-	DefaultIdleTimeout = 0 * time.Second
-
-	// ConfigVersion is the only schema version this build understands.
-	ConfigVersion = 1
-)
+// ConfigVersion is the only schema version this build understands.
+const ConfigVersion = 1
 
 // Config is the root of the configuration file.
 type Config struct {
 	Version   int                   `yaml:"version"`   // schema version (must be 1)
 	Listeners []ListenerConfig      `yaml:"listeners"` // front-facing TCP listeners
 	Pools     map[string]PoolConfig `yaml:"pools"`     // backend groups, keyed by pool name
-}
-
-// ListenerConfig describes a single front-facing TCP listener.
-type ListenerConfig struct {
-	Name         string   `yaml:"name"`          // unique name (used for logs and lookup)
-	Addr         string   `yaml:"addr"`          // listen address, e.g. "127.0.0.1:8080"
-	UpstreamPool string   `yaml:"upstream_pool"` // name of the target pool in Config.Pools
-	MaxConns     int      `yaml:"max_conns"`     // max concurrent connections; 0 = unlimited
-	DialTimeout  Duration `yaml:"dial_timeout"`  // upstream dial timeout (default 5s)
-	IdleTimeout  Duration `yaml:"idle_timeout"`  // per-direction idle timeout; 0 disables (default 0)
-}
-
-// PoolConfig describes a group of backend endpoints.
-type PoolConfig struct {
-	Balance string `yaml:"balance"` // "round_robin" (default) or "least_conn"
-	// Servers are backend "host:port" endpoints. Order is significant:
-	// round-robin visits them in order and least-conn breaks ties by it, so do
-	// not sort or reorder them casually.
-	Servers []string `yaml:"servers"`
 }
 
 // Load reads, parses and validates the configuration file at path.
@@ -74,82 +39,89 @@ func Load(path string) (*Config, error) {
 	if err := dec.Decode(&cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	if err := cfg.applyDefaultsAndValidate(); err != nil {
+	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
 }
 
-// applyDefaultsAndValidate fills in default timeouts and rejects invalid
-// configurations: wrong schema version, missing or duplicate listener names,
-// malformed addresses, unknown pool references, negative limits/timeouts, empty
-// pools, duplicate servers and unknown balance strategies. It mutates c in
-// place and is called by Load.
-func (c *Config) applyDefaultsAndValidate() error {
+// Validate applies defaults and rejects invalid configurations in place. It is
+// the single entry point for validating a Config: Load calls it, and a control
+// plane must call it before handing a configuration to Runtime.Reload, which
+// trusts its input.
+//
+// Each listener and pool validates itself; Validate only adds the rules that
+// need the whole document in view: unique listener names, unique listen
+// addresses and listener-to-pool references.
+func (c *Config) Validate() error {
 	if c.Version != ConfigVersion {
 		return fmt.Errorf("config: unsupported version %d (want %d)", c.Version, ConfigVersion)
 	}
 	if len(c.Listeners) == 0 {
-		return fmt.Errorf("config: no listeners defined")
+		return errors.New("config: no listeners defined")
 	}
+	if err := c.validateListeners(); err != nil {
+		return err
+	}
+	return c.validatePools()
+}
 
-	seen := make(map[string]bool, len(c.Listeners))
+// validateListeners validates every listener, then enforces the rules that span
+// listeners: unique names, unique (non-ephemeral) addresses and an
+// upstream_pool that actually exists.
+func (c *Config) validateListeners() error {
+	seenName := make(map[string]bool, len(c.Listeners))
+	seenAddr := make(map[string]bool, len(c.Listeners))
 	for i := range c.Listeners {
 		l := &c.Listeners[i]
-		switch {
-		case l.Name == "":
-			return fmt.Errorf("listener[%d]: name is required", i)
-		case seen[l.Name]:
-			return fmt.Errorf("listener %q: duplicate name", l.Name)
-		case l.Addr == "":
-			return fmt.Errorf("listener %q: addr is required", l.Name)
-		case l.UpstreamPool == "":
-			return fmt.Errorf("listener %q: upstream_pool is required", l.Name)
+		label := listenerLabel(i, l.Name)
+		if err := l.Validate(); err != nil {
+			return fmt.Errorf("%s: %w", label, err)
 		}
-		seen[l.Name] = true
-
-		if err := validateAddr(l.Addr, false); err != nil {
-			return fmt.Errorf("listener %q: %w", l.Name, err)
+		if seenName[l.Name] {
+			return fmt.Errorf("%s: duplicate name", label)
+		}
+		seenName[l.Name] = true
+		// Two listeners on one address would fight over the same socket. Port 0
+		// means "any free port", so it is exempt from the check.
+		if !hasZeroPort(l.Addr) {
+			if seenAddr[l.Addr] {
+				return fmt.Errorf("%s: duplicate addr %q", label, l.Addr)
+			}
+			seenAddr[l.Addr] = true
 		}
 		if _, ok := c.Pools[l.UpstreamPool]; !ok {
-			return fmt.Errorf("listener %q: unknown upstream_pool %q", l.Name, l.UpstreamPool)
-		}
-		if l.DialTimeout == 0 {
-			l.DialTimeout = Duration(DefaultDialTimeout)
-		} else if l.DialTimeout < 0 {
-			return fmt.Errorf("listener %q: dial_timeout cannot be negative", l.Name)
-		}
-		if l.IdleTimeout == 0 {
-			l.IdleTimeout = Duration(DefaultIdleTimeout)
-		} else if l.IdleTimeout < 0 {
-			return fmt.Errorf("listener %q: idle_timeout cannot be negative", l.Name)
-		}
-		if l.MaxConns < 0 {
-			return fmt.Errorf("listener %q: max_conns cannot be negative", l.Name)
-		}
-	}
-
-	for name, p := range c.Pools {
-		if len(p.Servers) == 0 {
-			return fmt.Errorf("pool %q: at least one server is required", name)
-		}
-		switch p.Balance {
-		case "", "round_robin", "least_conn":
-		default:
-			return fmt.Errorf("pool %q: unknown balance %q (want round_robin or least_conn)", name, p.Balance)
-		}
-		seenServer := make(map[string]bool, len(p.Servers))
-		for _, s := range p.Servers {
-			if err := validateAddr(s, true); err != nil {
-				return fmt.Errorf("pool %q: %w", name, err)
-			}
-			if seenServer[s] {
-				return fmt.Errorf("pool %q: duplicate server %q", name, s)
-			}
-			seenServer[s] = true
+			return fmt.Errorf("%s: unknown upstream_pool %q", label, l.UpstreamPool)
 		}
 	}
 	return nil
+}
+
+// validatePools validates every pool, naming the offending pool in the error.
+func (c *Config) validatePools() error {
+	for name := range c.Pools {
+		p := c.Pools[name]
+		if err := p.Validate(); err != nil {
+			return fmt.Errorf("pool %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// listenerLabel identifies a listener in error messages, falling back to its
+// index when the name is missing.
+func listenerLabel(i int, name string) string {
+	if name == "" {
+		return fmt.Sprintf("listener[%d]", i)
+	}
+	return fmt.Sprintf("listener %q", name)
+}
+
+// hasZeroPort reports whether addr uses port 0, the "any free port" marker. The
+// address is assumed to be already validated, so SplitHostPort cannot fail.
+func hasZeroPort(addr string) bool {
+	_, port, err := net.SplitHostPort(addr)
+	return err == nil && port == "0"
 }
 
 // validateAddr checks that addr is a well-formed "host:port".

@@ -50,7 +50,7 @@ func newTestServer(t *testing.T, mutate func(*config.ListenerConfig)) (string, *
 		Name:         "edge",
 		Addr:         "127.0.0.1:0",
 		UpstreamPool: "web",
-		DialTimeout:  config.Duration(time.Second),
+		DialTimeout:  time.Second,
 	}
 	if mutate != nil {
 		mutate(&lc)
@@ -101,7 +101,7 @@ func TestProxyForwardsBytes(t *testing.T) {
 			Name:         "edge",
 			Addr:         "127.0.0.1:0",
 			UpstreamPool: "web",
-			DialTimeout:  config.Duration(time.Second),
+			DialTimeout:  time.Second,
 		}},
 		Pools: map[string]config.PoolConfig{
 			"web": {Balance: "round_robin", Servers: []string{echoAddr}},
@@ -256,7 +256,7 @@ func TestCancelClosesConnection(t *testing.T) {
 	echoAddr := startEcho(t)
 	cfg := &config.Config{
 		Version:   1,
-		Listeners: []config.ListenerConfig{{Name: "edge", Addr: "127.0.0.1:0", UpstreamPool: "web", DialTimeout: config.Duration(time.Second)}},
+		Listeners: []config.ListenerConfig{{Name: "edge", Addr: "127.0.0.1:0", UpstreamPool: "web", DialTimeout: time.Second}},
 		Pools:     map[string]config.PoolConfig{"web": {Servers: []string{echoAddr}}},
 	}
 	srv := NewServer(testLogger(), NewRuntime(cfg))
