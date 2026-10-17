@@ -45,10 +45,7 @@ func run() error {
 	rt := proxy.NewRuntime(cfg)
 	srv := proxy.NewServer(log, rt)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	if err := srv.Start(ctx); err != nil {
+	if err := srv.Start(); err != nil {
 		return err
 	}
 	log.Info("wasmgate started", "config_version", rt.Load().Version)
@@ -70,19 +67,21 @@ func run() error {
 				log.Error("reload failed, keeping previous config", "err", err)
 				continue
 			}
-			v := rt.Reload(newCfg)
+			v, err := srv.Reload(context.Background(), newCfg)
+			if err != nil {
+				log.Error("reload failed, keeping previous config", "err", err)
+				continue
+			}
 			log.Info("configuration reloaded", "config_version", v)
 			continue
 		}
 
 		log.Info("shutting down", "signal", s.String())
-		cancel()
-
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), *shutdownGrace)
 		err := srv.Shutdown(shutCtx)
 		shutCancel()
 		if err != nil {
-			log.Warn("graceful shutdown incomplete", "err", err)
+			log.Warn("connections force-closed after grace expired", "err", err)
 		}
 		return nil
 	}

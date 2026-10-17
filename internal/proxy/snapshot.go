@@ -13,8 +13,10 @@ import (
 type resolvedListener struct {
 	cfg  config.ListenerConfig
 	pool *Pool
-	// sem enforces cfg.MaxConns when it is > 0; nil means "unlimited".
-	sem chan struct{}
+	// limiter enforces cfg.MaxConns; nil means "unlimited" (max_conns == 0).
+	// The limiter itself survives reloads (see state.go), so the count does not
+	// reset when the configuration is re-published.
+	limiter *connLimiter
 }
 
 // Snapshot is an immutable, ready-to-use view of the configuration together
@@ -43,14 +45,16 @@ type Runtime struct {
 	cur atomic.Pointer[Snapshot]
 	// mu serializes Reload. The pointer swap itself is atomic, but computing the
 	// next version is a read-modify-write: without this lock two concurrent
-	// reloads could publish the same version (a lost update).
-	mu sync.Mutex
+	// reloads could publish the same version (a lost update). It also serializes
+	// access to the registry, which only the cold path touches.
+	mu       sync.Mutex
+	registry *registry
 }
 
 // NewRuntime builds the first snapshot (version 1) from cfg.
 func NewRuntime(cfg *config.Config) *Runtime {
-	r := &Runtime{}
-	r.cur.Store(buildSnapshot(1, cfg))
+	r := &Runtime{registry: newRegistry()}
+	r.cur.Store(r.build(1, cfg))
 	return r
 }
 
@@ -59,34 +63,42 @@ func (r *Runtime) Load() *Snapshot { return r.cur.Load() }
 
 // Reload compiles a new snapshot and publishes it, returning the new version.
 // Safe for concurrent use.
+//
+// Precondition: cfg must already be validated (see config.Config.Validate).
 func (r *Runtime) Reload(cfg *config.Config) uint64 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	next := buildSnapshot(r.cur.Load().Version+1, cfg)
+	next := r.build(r.cur.Load().Version+1, cfg)
 	r.cur.Store(next)
 	return next.Version
 }
 
-// buildSnapshot compiles cfg into a ready-to-use Snapshot: it turns every
-// configured pool into a live Pool (upstreams + balancer), pre-resolves every
-// listener to its pool (and its connection limit), and tags the result with the
-// given version. All allocation happens here, up front, so the data path only
-// ever reads.
-func buildSnapshot(version uint64, cfg *config.Config) *Snapshot {
+// build compiles cfg into a ready-to-use Snapshot: it turns every configured
+// pool into a live Pool (upstreams + balancer), pre-resolves every listener to
+// its pool (and its connection limiter), and tags the result with the given
+// version. All allocation happens here, up front, so the data path only ever
+// reads.
+//
+// Caller must hold r.mu (or be the single-threaded constructor).
+func (r *Runtime) build(version uint64, cfg *config.Config) *Snapshot {
 	pools := make(map[string]*Pool, len(cfg.Pools))
 	for name, pc := range cfg.Pools {
-		pools[name] = newPool(name, pc.Servers, pc.Balance)
+		pools[name] = newPool(name, pc.Servers, pc.Balance, r.registry)
 	}
 
 	listeners := make(map[string]resolvedListener, len(cfg.Listeners))
 	for _, lc := range cfg.Listeners {
 		rl := resolvedListener{cfg: lc, pool: pools[lc.UpstreamPool]}
+		// Always fetch the registry limiter (this also (re)sets its limit);
+		// expose it only when a limit is actually configured.
+		lim := r.registry.limiter(lc.Name, int64(lc.MaxConns))
 		if lc.MaxConns > 0 {
-			rl.sem = make(chan struct{}, lc.MaxConns)
+			rl.limiter = lim
 		}
 		listeners[lc.Name] = rl
 	}
 
+	r.registry.prune(cfg)
 	return &Snapshot{Version: version, Config: cfg, listeners: listeners}
 }

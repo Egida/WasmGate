@@ -1,0 +1,139 @@
+package proxy
+
+import (
+	"sync"
+	"sync/atomic"
+
+	"wasmgate/internal/config"
+)
+
+// This file holds runtime state that must OUTLIVE a configuration snapshot.
+//
+// Why it exists: a Snapshot is rebuilt from scratch on every reload. Anything
+// whose value depends on history — how many connections a listener is currently
+// serving, how many a backend is currently serving — must not live inside the
+// snapshot, or a reload would silently reset it:
+//
+//   - max_conns would restart at zero on every reload, so N reloads would let N
+//     times the limit through (a hole exactly where flood protection matters);
+//   - least_conn would forget in-flight connections and briefly over-send to a
+//     backend.
+//
+// The registry keys this state by a stable identity (listener name, upstream
+// address) and hands the same object to every snapshot, so counters keep adding
+// up across reloads. The data path only ever touches the atomics inside these
+// objects — never the registry map — so the hot path stays lock-free.
+type registry struct {
+	mu        sync.Mutex
+	limiters  map[string]*connLimiter
+	upstreams map[string]*upstream
+}
+
+func newRegistry() *registry {
+	return &registry{
+		limiters:  make(map[string]*connLimiter),
+		upstreams: make(map[string]*upstream),
+	}
+}
+
+// limiter returns the connection limiter for a listener name, creating it on
+// first use, and (re)sets its limit. The limit may change freely on reload: a
+// lower limit simply starts refusing new connections while the active count
+// drains down to it.
+func (g *registry) limiter(name string, max int64) *connLimiter {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	l := g.limiters[name]
+	if l == nil {
+		l = &connLimiter{}
+		g.limiters[name] = l
+	}
+	l.max.Store(max)
+	return l
+}
+
+// upstream returns the endpoint object for an address, creating it on first
+// use. Two pools that reference the same address share the object (and thus the
+// active counter), which is what you want: they point at the same backend.
+func (g *registry) upstream(addr string) *upstream {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	u := g.upstreams[addr]
+	if u == nil {
+		u = &upstream{addr: addr}
+		g.upstreams[addr] = u
+	}
+	return u
+}
+
+// prune drops state that is no longer referenced by cfg AND has drained to
+// zero. Entries with live users are kept: an in-flight connection still holds
+// its object and will release into it, so removing it early would lose that
+// decrement (and, if the name came back, reset the count). Such entries are
+// collected the next time a reload finds them at zero. This keeps the maps
+// bounded without ever resetting a live counter.
+func (g *registry) prune(cfg *config.Config) {
+	liveListeners := make(map[string]bool, len(cfg.Listeners))
+	for _, l := range cfg.Listeners {
+		liveListeners[l.Name] = true
+	}
+	liveUpstreams := make(map[string]bool)
+	for _, p := range cfg.Pools {
+		for _, s := range p.Servers {
+			liveUpstreams[s] = true
+		}
+	}
+
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for name, l := range g.limiters {
+		if !liveListeners[name] && l.cur.Load() == 0 {
+			delete(g.limiters, name)
+		}
+	}
+	for addr, u := range g.upstreams {
+		if !liveUpstreams[addr] && u.active.Load() == 0 {
+			delete(g.upstreams, addr)
+		}
+	}
+}
+
+// connLimiter is a lock-free, reload-safe concurrent connection limit. A max of
+// 0 means unlimited.
+type connLimiter struct {
+	max atomic.Int64
+	cur atomic.Int64
+}
+
+// acquire reserves a slot, reporting false when the limit is currently reached.
+func (l *connLimiter) acquire() bool {
+	for {
+		max := l.max.Load()
+		if max <= 0 {
+			return true // unlimited
+		}
+		cur := l.cur.Load()
+		if cur >= max {
+			return false
+		}
+		if l.cur.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+// release returns a slot. Safe to call once per successful acquire.
+func (l *connLimiter) release() {
+	for {
+		cur := l.cur.Load()
+		if cur <= 0 {
+			return // defensive: never go negative
+		}
+		if l.cur.CompareAndSwap(cur, cur-1) {
+			return
+		}
+	}
+}
+
+// limit returns the current maximum (0 = unlimited), for logging.
+func (l *connLimiter) limit() int64 { return l.max.Load() }

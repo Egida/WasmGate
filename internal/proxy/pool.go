@@ -2,15 +2,11 @@ package proxy
 
 // Pool groups upstreams under a single balancing strategy.
 //
-// A Pool is (re)built from a configuration snapshot. Its balancing state is
-// mutable, but because callers hold the exact *upstream they reserved, a pool
-// rebuilt during a reload can never decrement the wrong counter — the old
-// *upstream simply becomes garbage once its connections drain.
-//
-// Note: after a reload the new pool starts with fresh counters (active == 0),
-// so connections still running on the old pool are not counted by the new one.
-// For least_conn this causes a short-lived imbalance until the old connections
-// drain; for round_robin it does not matter.
+// A Pool is (re)built from a configuration snapshot, but the *upstream objects
+// it points at come from the long-lived registry, so their active counters keep
+// counting across reloads (see state.go). Callers hold the exact *upstream they
+// reserved, so a pool rebuilt during a reload can never decrement the wrong
+// counter.
 type Pool struct {
 	name     string      // pool name from the config (used in logs)
 	servers  []*upstream // upstreams in config order; balancers rely on this order
@@ -18,18 +14,19 @@ type Pool struct {
 }
 
 // newPool constructs a pool together with its balancer. balance is the raw
-// config string; newBalancer maps it to a strategy.
+// config string; newBalancer maps it to a strategy. Endpoint objects are taken
+// from g so their counters survive reloads.
 //
 // Precondition: servers must be non-empty. Config validation guarantees this,
 // and an empty slice here would make balancer selection panic, so we fail fast
 // on a programming error.
-func newPool(name string, servers []string, balance string) *Pool {
+func newPool(name string, servers []string, balance string, g *registry) *Pool {
 	if len(servers) == 0 {
 		panic("proxy: newPool called with an empty server list")
 	}
 	ups := make([]*upstream, 0, len(servers))
 	for _, s := range servers {
-		ups = append(ups, &upstream{addr: s})
+		ups = append(ups, g.upstream(s))
 	}
 	return &Pool{name: name, servers: ups, balancer: newBalancer(balance)}
 }

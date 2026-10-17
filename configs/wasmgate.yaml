@@ -10,8 +10,10 @@ listeners:
     upstream_pool: web
     max_conns: 10000          # max concurrent connections (0 = unlimited)
     dial_timeout: 3s          # upstream dial timeout
-    idle_timeout: 0s          # per-direction idle timeout; 0 = disabled (keeps zero-copy
-                              # splice); set e.g. 60s in production to reap silent conns
+    idle_timeout: 0s          # connection idle timeout; 0 = disabled (keeps zero-copy
+                              # splice). When enabled, the deadline is refreshed by activity
+                              # in EITHER direction, so a slow one-way download is not cut;
+                              # set e.g. 60s in production to reap silent conns.
 
   - name: db
     addr: "127.0.0.1:5433"

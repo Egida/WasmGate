@@ -4,6 +4,16 @@ import (
 	"context"
 	"log/slog"
 	"net"
+	"time"
+
+	"wasmgate/internal/observe"
+)
+
+// logWindow and logBurst bound how often per-connection "expected under load"
+// events are logged, so a flood cannot turn the log into a denial of service.
+const (
+	logWindow = time.Second
+	logBurst  = 2
 )
 
 // Proxy is the data-path handler: it turns an accepted client connection into a
@@ -16,19 +26,22 @@ import (
 //   - WASM plugin hooks: on_accept / on_data / on_close, invoked around the
 //     data loop.
 type Proxy struct {
-	log *slog.Logger // structured logger
-	rt  *Runtime     // source of the current snapshot
+	log     *slog.Logger     // structured logger
+	rt      *Runtime         // source of the current snapshot
+	sampler *observe.Limiter // rate-limits per-connection log events
 }
 
 // New returns a Proxy that reads configuration from rt on every connection.
 func New(log *slog.Logger, rt *Runtime) *Proxy {
-	return &Proxy{log: log, rt: rt}
+	return &Proxy{log: log, rt: rt, sampler: observe.NewLimiter(logWindow, logBurst)}
 }
 
 // Handle proxies a single accepted client connection. It always closes client.
 //
-// The current snapshot is captured once and used for the whole lifetime of the
-// connection, so a configuration reload mid-connection cannot affect it.
+// ctx parents the whole session and is cancelled only on a hard stop (or after
+// the shutdown grace expires); it is what force-closes the connection. The
+// snapshot is captured once and used for the lifetime of the connection, so a
+// configuration reload mid-connection cannot affect it.
 func (p *Proxy) Handle(ctx context.Context, listenerName string, client net.Conn) {
 	defer client.Close()
 
@@ -44,18 +57,22 @@ func (p *Proxy) Handle(ctx context.Context, listenerName string, client net.Conn
 		return
 	}
 
-	// Enforce the per-listener connection limit (max_conns == 0 means unlimited).
-	if rl.sem != nil {
-		select {
-		case rl.sem <- struct{}{}:
-			defer func() { <-rl.sem }()
-		default:
-			p.log.Warn("connection limit reached", "listener", listenerName, "max_conns", cap(rl.sem))
+	// Enforce the per-listener connection limit (nil limiter means unlimited).
+	if rl.limiter != nil {
+		if !rl.limiter.acquire() {
+			if ok, dropped := p.sampler.Allow("limit:" + listenerName); ok {
+				p.log.Warn("connection limit reached",
+					"listener", listenerName,
+					"max_conns", rl.limiter.limit(),
+					"suppressed", dropped,
+				)
+			}
 			return
 		}
+		defer rl.limiter.release()
 	}
 
-	// --- FUTURE: DDoS / sliding-window rate limit check goes HERE. ---
+	// --- FUTURE: connection-flood rate limit (sliding window) goes HERE. ---
 
 	up := rl.pool.Next()
 	defer rl.pool.Release(up)
@@ -66,7 +83,14 @@ func (p *Proxy) Handle(ctx context.Context, listenerName string, client net.Conn
 	var d net.Dialer
 	server, err := d.DialContext(dialCtx, "tcp", up.addr)
 	if err != nil {
-		p.log.Warn("dial upstream failed", "listener", listenerName, "upstream", up.addr, "err", err)
+		if ok, dropped := p.sampler.Allow("dial:" + listenerName + ":" + up.addr); ok {
+			p.log.Warn("dial upstream failed",
+				"listener", listenerName,
+				"upstream", up.addr,
+				"err", err,
+				"suppressed", dropped,
+			)
+		}
 		return
 	}
 	defer server.Close()
