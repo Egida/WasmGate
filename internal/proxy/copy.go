@@ -4,23 +4,41 @@ import (
 	"context"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"time"
 )
+
+// idleBufferSize is the size of the pooled copy buffers. 32 KiB matches
+// io.Copy's own default and keeps syscalls amortised.
+const idleBufferSize = 32 * 1024
+
+// bufferPool recycles copy buffers, so a relayed connection allocates no
+// per-connection buffer. It backs the idle-aware path on every platform, and
+// the plain path on the platforms without kernel zero-copy (see copyPlain).
+var bufferPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, idleBufferSize)
+		return &b
+	},
+}
 
 // join pumps bytes in both directions until both are done, or until ctx is
 // cancelled.
 //
 // Two copy paths exist:
 //
-//   - idle == 0: plain io.Copy. When the destination is a *net.TCPConn, io.Copy
-//     calls TCPConn.ReadFrom, which on Linux is implemented with splice(2) — the
-//     kernel moves bytes between the two sockets without an extra user-space
-//     copy. This is our zero-copy fast path.
-//   - idle > 0: each direction refreshes a read deadline before every read, so a
-//     connection that stays silent for longer than idle is reaped. This path
-//     buffers bytes (splice is not used) but keeps half-open connections from
-//     lingering forever.
+//   - idle == 0: the plain relay, copyPlain. On Linux it delegates to
+//     io.Copy(dst, src), which reaches TCPConn.ReadFrom and thereby splice(2):
+//     the kernel moves bytes between the two sockets with no user-space copy and
+//     no buffer allocation. That is our zero-copy fast path. Off Linux there is
+//     no such syscall, so copyPlain relays through the same standard
+//     io.CopyBuffer loop with a pooled buffer instead.
+//   - idle > 0: a connection-wide idle watchdog. The deadline expires only when
+//     the whole connection has been silent for the whole idle period: a long
+//     one-way transfer (a slow download, an SSE stream) keeps the silent
+//     back-channel alive. This path must inspect every chunk, so it buffers
+//     (through the pool) and never splices.
 //
 // Half-close is preserved on a clean EOF: we CloseWrite the destination so
 // protocols that rely on signalling EOF keep working while the other direction
@@ -63,29 +81,72 @@ func pipe(wg *sync.WaitGroup, dst, src net.Conn, idle time.Duration) {
 // copyConn copies src -> dst, choosing the zero-copy path when idle is disabled
 // and the idle-aware buffered path otherwise.
 func copyConn(dst, src net.Conn, idle time.Duration) error {
-	var r io.Reader = src
-	if idle > 0 {
-		r = &deadlineReader{conn: src, idle: idle}
+	if idle <= 0 {
+		return copyPlain(dst, src)
 	}
-	_, err := io.Copy(dst, r)
+	return copyWatched(dst, src, idle)
+}
+
+// copyPlain relays src -> dst with no idle watchdog.
+//
+// On Linux io.Copy reaches TCPConn.ReadFrom, which is implemented with
+// splice(2) when both ends are sockets: the kernel moves the bytes, and
+// nothing is allocated. Elsewhere there is no such syscall, and io.Copy falls
+// back to genericReadFrom / io.copyBuffer — a fresh 32 KiB buffer per
+// direction, ~64 KiB of garbage per connection. Handing the standard
+// io.CopyBuffer loop one buffer from bufferPool instead (with the
+// destination's fast path hidden behind a bare io.Writer) removes that
+// garbage; the same trick cannot be applied unconditionally, because on Linux
+// hiding TCPConn.ReadFrom would hide the path to splice itself.
+//
+// What remains is two interface wrappers per connection, ~64 B: the whole
+// price of the pool.
+func copyPlain(dst, src net.Conn) error {
+	if runtime.GOOS == "linux" {
+		_, ioErr := io.Copy(dst, src)
+		return ioErr
+	}
+	bufp := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufp)
+	_, err := io.CopyBuffer(struct{ io.Writer }{dst}, struct{ io.Reader }{src}, *bufp)
 	return err
 }
 
-// deadlineReader refreshes a read deadline before every read, turning it into an
-// idle timeout.
+// copyWatched copies src -> dst through a pooled buffer while refreshing the
+// idle deadline on both endpoints. It is copyPlain's pooled relay plus the
+// watchdog: with idle > 0 every chunk must be inspected anyway, so splice
+// stays out of reach by construction (the source is an activityReader and the
+// destination is handed over as a bare io.Writer).
+func copyWatched(dst, src net.Conn, idle time.Duration) error {
+	bufp := bufferPool.Get().(*[]byte)
+	defer bufferPool.Put(bufp)
+	r := &activityReader{conn: src, peer: dst, idle: idle}
+	_, err := io.CopyBuffer(struct{ io.Writer }{dst}, r, *bufp)
+	return err
+}
+
+// activityReader refreshes a read deadline on BOTH endpoints before its source
+// is read from, turning the deadline into a connection-wide idle timeout: any
+// byte in either direction keeps the whole connection alive. Refreshing only
+// the source (a per-direction watchdog) would reap one-way transfers — a slow
+// download or an SSE stream — mid-stream, while the back-channel is expected to
+// be silent.
 //
 // Note: because it is not a *net.TCPConn, io.Copy cannot use splice(2) for this
 // direction — that is the price of an idle watchdog. Set idle_timeout to 0 to
 // keep the zero-copy path.
-type deadlineReader struct {
+type activityReader struct {
 	conn net.Conn
+	peer net.Conn
 	idle time.Duration
 }
 
-func (r *deadlineReader) Read(p []byte) (int, error) {
-	if err := r.conn.SetReadDeadline(time.Now().Add(r.idle)); err != nil {
+func (r *activityReader) Read(p []byte) (int, error) {
+	deadline := time.Now().Add(r.idle)
+	if err := r.conn.SetReadDeadline(deadline); err != nil {
 		return 0, err
 	}
+	_ = r.peer.SetReadDeadline(deadline)
 	return r.conn.Read(p)
 }
 
