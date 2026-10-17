@@ -8,22 +8,27 @@
 
 ## Текущий статус и следующий шаг
 
-**Реализовано (M0/M1 + каркас M2):** L4 TCP reverse proxy на `net` — приём
-соединений, балансировка `round_robin`/`least_conn`, проксирование
-(`io.Copy` → `splice` на Linux; fast path при `idle_timeout: 0`), таймауты
-(`dial_timeout`, `idle_timeout`), лимит соединений `max_conns`, half-close и
-корректный teardown при ошибке/отмене контекста, graceful drain, reload конфига
-по SIGHUP через атомарный snapshot, строгая валидация конфига, структурные логи,
-сборка без CGO. Покрыто тестами (`go test ./...`).
+**Реализовано (M0–M2):** L4 TCP reverse proxy на `net` — приём соединений,
+балансировка `round_robin`/`least_conn`, проксирование (`io.Copy` → `splice` на
+Linux; fast path при `idle_timeout: 0`), таймауты (`dial_timeout`,
+`idle_timeout` — общий для соединения, а не по направлениям), лимит соединений
+`max_conns`, half-close и корректный teardown при ошибке/принудительном закрытии,
+graceful shutdown (сначала перестаём принимать, затем drain до grace, и только
+потом — принудительное закрытие), reload конфига по SIGHUP через атомарный
+snapshot, **reconcile слушателей** (добавление/удаление адресов без перезапуска),
+сохранение счётчиков лимитов и балансировщика между reload, ограничение частоты
+«шумных» логов, строгая валидация конфига, структурные логи, сборка без CGO.
+Покрыто тестами (`go test ./...`).
 
-**Ещё не реализовано:** DDoS/rate-limit, WASM-плагины, SNI/TLS-peek, health-checks,
-метрики/pprof, CLI, нагрузочные бенчмарки. Куда встраивать — §10 «Рецепты».
+**Ещё не реализовано:** защита от connection flood (rate-limit), WASM-плагины,
+SNI/TLS-peek, health-checks, метрики/pprof, CLI, нагрузочные бенчмарки. Куда
+встраивать — §10 «Рецепты».
 
-**Следующий шаг:** пакет `internal/ratelimit` (DDoS на скользящем окне — первая
-фича ядра). Чек-лист и точка вставки — §10.3; в коде это метка `FUTURE` в
+**Следующий шаг:** пакет `internal/ratelimit` (скользящее окно — первая фича
+ядра). Чек-лист и точка вставки — §10.3; в коде это метка `FUTURE` в
 `internal/proxy/proxy.go`.
 
-**Milestones:** M0 ✅ · M1 ✅ · M2 🟡 (каркас) · M3 ⏳ · M4–M6 ⏳ (см. `docs/05`).
+**Milestones:** M0 ✅ · M1 ✅ · M2 ✅ · M3 ⏳ · M4–M6 ⏳ (см. `docs/05`).
 
 ---
 
@@ -73,24 +78,39 @@ WasmGate/
 │   └── signals_windows.go   только Ctrl+C                    [//go:build windows]
 ├── internal/
 │   ├── config/
-│   │   ├── config.go        схема YAML, Load(), валидация, дефолты
-│   │   ├── duration.go      тип Duration (парсит "3s" из YAML)
-│   │   └── config_test.go   тесты загрузки/валидации
+│   │   ├── config.go           корень Config, Load(), кросс-полевой Validate()
+│   │   ├── listener_config.go  ListenerConfig + Validate + дефолты таймаутов
+│   │   ├── pool_config.go      PoolConfig + Validate
+│   │   ├── config_test.go      тесты Load + бенчи Load/Validate
+│   │   ├── listener_config_test.go  тесты listener'а и его дефолтов
+│   │   └── pool_config_test.go      тесты пула
 │   ├── proxy/               ← СЕРДЦЕ data plane
 │   │   ├── doc.go           обзор пакета (архитектура, швы расширения)
-│   │   ├── server.go        Server: листенеры, accept-loop, graceful shutdown
+│   │   ├── server.go        Server: листенеры, accept-loop, reload, shutdown
 │   │   ├── proxy.go         Proxy.Handle: обработка одного соединения
 │   │   ├── pool.go          Pool: upstream'ы + балансировщик
 │   │   ├── upstream.go      upstream + интерфейс Balancer (RR, least-conn)
+│   │   ├── state.go         registry: счётчики, живущие дольше snapshot
 │   │   ├── copy.go          join(): двунаправленный copy (splice + idle/ctx)
 │   │   ├── snapshot.go      Runtime/Snapshot: atomic-конфиг + индекс листенеров
-│   │   └── proxy_test.go    e2e-тест + балансировщики, reload, max_conns, cancel
+│   │   ├── server_test.go   тесты + бенч server.go: lifecycle, ConnectionSetup
+│   │   ├── proxy_test.go    тесты + бенч proxy.go: проброс, hot path
+│   │   ├── copy_test.go     тесты + бенчи copy.go: idle_timeout, throughput
+│   │   ├── snapshot_test.go тесты + бенчи snapshot.go: версии, Load/Reload
+│   │   ├── state_test.go    тесты + бенч state.go: max_conns / limiter
+│   │   ├── upstream_test.go тесты + бенч upstream.go: балансировщики
+│   │   ├── pool_test.go     тесты pool.go: резервирование слотов
+│   │   └── helpers_test.go  общие фикстуры: echo, сервер, dial, конфиг, sinks
 │   └── observe/
-│       └── log.go           конструктор логгера (log/slog)
+│       ├── log.go           конструктор логгера (log/slog)
+│       ├── limiter.go       ограничитель частоты логов (анти-«шторм»)
+│       ├── limiter_test.go  тесты + бенчи лог-лимитера
+│       └── log_test.go      тесты разбора уровня логирования
 ├── configs/
 │   ├── wasmgate.yaml        основной пример
 │   └── local-echo.yaml      конфиг для smoke-теста (см. §5)
-├── plugins/ benchmarks/ deployments/   заглушки под будущие milestone'ы
+├── benchmarks/              методика измерений Go-бенчей (см. benchmarks/README)
+├── plugins/ deployments/    заглушки под будущие milestone'ы
 ├── docs/                    01–07: проектная документация (Obsidian)
 ├── go.mod / go.sum
 ├── Makefile / .golangci.yml / .gitignore
@@ -161,19 +181,57 @@ go test -race ./...                              # детектор гонок (
 
 ### 4.3. Бенчмарки
 
+Бенчи — в `*_test.go` (в бинарь не попадают), в том же файле, что и тесты
+исходника: у каждого `X.go` ровно один `X_test.go`, сначала тесты, ниже бенчи.
+Подпапок `bench/` нет — так же устроена и стандартная библиотека Go
+(`sync/mutex_test.go`, `net/http/serve_test.go` содержат и `TestXxx`, и
+`BenchmarkXxx`).
+
+Разложены по исходнику, который мерят:
+
+- `copy_test.go` — релей: `Throughput`, `ThroughputScaling`, `RelayLatency`;
+- `server_test.go` — установление соединений: `ConnectionSetup`;
+- `snapshot_test.go` — шов hot reload: `RuntimeLoad`, `Reload`;
+- `proxy_test.go`, `state_test.go`, `upstream_test.go` — микро: горячий путь,
+  лимитер, балансировщик;
+- `internal/config/config_test.go` — `Load` / `Validate` (цена SIGHUP);
+- `internal/observe/limiter_test.go` — лог-лимитер.
+
+В отдельный пакет (подпапку) бенчи не выносят: подпапка — это отдельный пакет, и
+он видит только экспортированные символы. А мерят бенчи как раз неэкспортируемое —
+`connLimiter`, `*upstream`, `resolvedListener`, `Snapshot.listeners` — и
+`export_test.go` тут не помогает: файлы `_test.go` пакета попадают лишь в *его*
+тестовый бинарь. Альтернатива — расширять публичный API ради бенчей, что хуже.
+
 ```powershell
 # все бенчмарки с аллокациями
 go test -run '^$' -bench . -benchmem ./...
 
-# конкретный пакет + профили
+# только e2e-пропускная способность прокси (подбенчи = варианты)
+go test -run '^$' -bench 'BenchmarkThroughput' -benchmem ./internal/proxy
+
+# масштабирование по числу соединений
+go test -run '^$' -bench 'BenchmarkThroughputScaling' -benchmem ./internal/proxy
+
+# микро-бенчи прокси + профили
 go test -run '^$' -bench . -benchmem -cpuprofile cpu.out -memprofile mem.out ./internal/proxy
 
-# сравнить «до/после» через benchstat
-go test -run '^$' -bench . -benchmem ./... > new.txt
+# сравнить «до/после»: N прогонов и benchstat
+go test -run '^$' -bench . -benchmem -count=10 ./... > new.txt
 benchstat old.txt new.txt
 ```
 
-Ключевые метрики: `ns/op`, `allocs/op`, `B/op`. Для fast path цель — **`0 allocs/op`** в steady state.
+Ключевые метрики: `ns/op`, `MB/s` (где задан `b.SetBytes`), `allocs/op`, `B/op`.
+Для fast path цель — **`0 allocs/op`** в steady state. Полная таблица «что чем
+меряем» — `benchmarks/README.md`.
+
+> **Платформа.** Zero-copy `splice(2)` есть только на Linux: на Windows/macOS оба
+> варианта бенча идут через user-space copy, и только Linux-прогон что-то говорит
+> о zero-copy (там разница кратная: 2.1–2.7× на 64 KiB). На fast path код не
+> различает платформы — Linux просто доходит до `splice(2)` через `io.Copy`; на
+> остальных `copyPlain` передаёт стандартному `io.CopyBuffer` буфер из пула
+> (одна проверка `runtime.GOOS` в copy.go, без build-тегов). Подробно —
+> `benchmarks/README.md`, §«Платформа».
 
 ### 4.4. Качество кода
 
@@ -257,18 +315,18 @@ main.run()
   ├─ config.Load(path)                     схема + валидация
   ├─ proxy.NewRuntime(cfg)                 Snapshot v1 + компиляция пулов
   ├─ proxy.NewServer(log, rt)
-  ├─ srv.Start(ctx)                        bind листенеров + accept-loop на каждый
-  └─ ждём сигналов (Ctrl+C / SIGHUP)
+  ├─ srv.Start()                           bind листенеров + accept-loop на каждый
+  └─ ждём сигналов: Ctrl+C/SIGTERM → Shutdown, SIGHUP → srv.Reload
 
 Соединение:
   acceptLoop()          server.go   Accept() → горутина на соединение
     └─ Proxy.Handle()   proxy.go    rt.Load() → резолв listener+pool (1 lookup)
-        ├─ max_conns    proxy.go    лимит соединений на listener (0 = без лимита)
-        ├─ (FUTURE) DDoS-проверка
+        ├─ max_conns    proxy.go    лимит соединений на listener (limiter из registry)
+        ├─ (FUTURE) rate-limit соединений
         ├─ pool.Next()  pool.go     балансировщик выбирает upstream (active++)
         ├─ DialContext  proxy.go    подключение к upstream (с dial_timeout)
         └─ join()       copy.go     copy в обе стороны; splice при idle_timeout=0,
-                                    иначе read-deadline по idle; teardown по ctx/ошибке
+                                    иначе общий idle-watchdog; teardown по ошибке
         └─ pool.Release(up)         active-- (защищено от двойного release)
 ```
 
@@ -282,15 +340,25 @@ main.run()
 
 ### `internal/config` — чистая конфигурация
 
-- `Config` — корень (`version`, `listeners`, `pools`).
-- `ListenerConfig` — фронтальный TCP-листенер.
-- `PoolConfig` — группа бэкендов (`balance`, `servers`).
-- `Duration` — обёртка над `time.Duration`, чтобы YAML понимал `"3s"`.
-- `Load(path)` — открыть → распарсить (`KnownFields(true)`) → дефолты → валидация.
-- Валидация (`applyDefaultsAndValidate`) отвергает: `version != 1`, пустой список
-  листенеров, дубли имён, неизвестный `upstream_pool`, некорректный адрес
-  (`host:port`, порт — число), отрицательные таймауты/`max_conns`, пустой пул,
-  дубли серверов и неизвестный `balance`. Сети не касается — адреса не резолвятся.
+Пакет разбит по областям: `config.go` — корень и общие правила, `listener_config.go`
+и `pool_config.go` — по объекту на файл.
+
+- `Config` (`config.go`) — корень (`version`, `listeners`, `pools`); его `Validate()`
+  добавляет только кросс-полевые правила: дубли имён/адресов, ссылки на пулы.
+- `ListenerConfig` (`listener_config.go`) — фронтальный TCP-листенер и дефолты
+  таймаутов.
+- `PoolConfig` (`pool_config.go`) — группа бэкендов (`balance`, `servers`).
+- `Load(path)` — открыть → распарсить (`KnownFields(true)`) → `Validate()`.
+- `Validate()` — применить дефолты и проверить конфиг (вызывается из `Load` и из
+  `Server.Reload`; тот же вход для будущего control plane).
+- Валидация отвергает: `version != 1`, пустой список листенеров, дубли имён и
+  адресов, неизвестный `upstream_pool`, некорректный адрес (`host:port`, порт —
+  число), отрицательные таймауты/`max_conns`, пустой пул, дубли серверов и
+  неизвестный `balance`. Сети не касается — адреса не резолвятся.
+
+Строки `dial_timeout`/`idle_timeout` парсятся стандартным `time.Duration`
+(`"3s"`, `"1500ms"`) — `gopkg.in/yaml.v3` понимает этот тип из коробки, отдельная
+обёртка не нужна.
 
 Никакого runtime-состояния здесь нет — только данные.
 
@@ -299,16 +367,25 @@ main.run()
 | Файл | Тип / функция | Роль |
 |------|---------------|------|
 | `snapshot.go` | `Snapshot`, `Runtime` | иммутабельный конфиг + `atomic.Pointer`; **шов hot reload** |
-| `server.go` | `Server` | bind листенеров, `acceptLoop`, `Shutdown` (drain) |
+| `server.go` | `Server` | bind/`Reload` листенеров, `acceptLoop`, `Shutdown` (drain) |
 | `proxy.go` | `Proxy.Handle` | обработка одного соединения |
 | `pool.go` | `Pool` | `Next()` (reserve) / `Release()` |
 | `upstream.go` | `upstream`, `Balancer` | эндпоинт + счётчик; `round_robin`, `least_conn` |
-| `copy.go` | `join` | двунаправленный pump, zero-copy `splice` |
+| `state.go` | `registry`, `connLimiter` | счётчики, переживающие reload (лимит, active) |
+| `copy.go` | `join`, `copyConn`, `activityReader` | двунаправленный pump; `io.Copy` → `splice(2)` на fast path, connection-wide idle watchdog с пулом буферов иначе |
 
 `Runtime`:
 ```go
 func (r *Runtime) Load() *Snapshot                 // lock-free чтение
 func (r *Runtime) Reload(cfg *config.Config) uint64 // публикация новой версии
+```
+
+`Server`:
+```go
+func (s *Server) Start() error                       // bind листенеров + accept-loop
+func (s *Server) Reload(ctx, cfg) (uint64, error)    // снимок + reconcile слушателей
+func (s *Server) Shutdown(ctx) error                 // drain, при истечении grace — форс
+func (s *Server) Addrs() []net.Addr
 ```
 
 ### `internal/observe`
@@ -327,13 +404,22 @@ func (r *Runtime) Reload(cfg *config.Config) uint64 // публикация но
 - **1 горутина на листенер** (accept-loop).
 - **1 горутина на соединение** (`Handle`).
 - **+2 горутины** внутри `join` (по одной на направление copy).
-- `sync.WaitGroup` в `Server` считает и accept-loop'ы, и обработчики — поэтому
-  `Shutdown` дожидается полного drain.
+- Два `sync.WaitGroup` в `Server`: `acceptWG` (accept-loop'ы) и `connWG`
+  (обработчики). `Shutdown` сначала дожидается `acceptWG`, и только потом
+  `connWG` — так ни один обработчик не может зарегистрироваться уже после начала
+  ожидания (Add, гоняющийся с Wait, — неопределённое поведение).
 - **Конфиг** — `atomic.Pointer`, на горячем пути **нет блокировок**; `Reload`
   сериализуется мьютексом (версия — это read-modify-write).
+- **Состояние, зависящее от истории** (лимит соединений, счётчики active)
+  вынесено в `registry` (`state.go`) и живёт дольше snapshot — reload его не
+  сбрасывает.
 - **Счётчики upstream** — типизированные атомики (`atomic.Int64`), безопасны на 32/64-бит.
-- `sync.Mutex` только там, где не горячо: список листенеров и `Reload`.
-- `ctx` доходит до `join`: отмена (shutdown) закрывает обе стороны соединения.
+- `sync.Mutex` только там, где не горячо: список листенеров, `Reload`, `registry`.
+- **Два контекста на стороне соединений**: `ctx` из `Start`/`Reload` не трогает
+  живые соединения; при `Shutdown` они сначала доигрывают, и лишь по истечении
+  grace (или при форс-остановке) их контекст отменяется и `join` закрывает обе стороны.
+- Паника в обработчике соединения перехватывается (`recover`) и логируется — она
+  не роняет весь прокси.
 
 ---
 
@@ -348,7 +434,7 @@ listeners:
     upstream_pool: web      # имя пула из pools
     max_conns: 10000        # лимит одновременных соединений (0 = без лимита)
     dial_timeout: 3s        # таймаут подключения к бэкенду (по умолчанию 5s)
-    idle_timeout: 0s        # per-direction idle-таймаут; 0 = выкл (по умолчанию)
+    idle_timeout: 0s        # idle-таймаут соединения; 0 = выкл (по умолчанию)
 
 pools:
   web:
@@ -358,36 +444,45 @@ pools:
       - "127.0.0.1:9002"
 ```
 
-Правила: `version` строго `1`; имена listener'ов уникальны; `upstream_pool`
-обязан существовать; `addr`/`servers` — корректный `host:port` (порт числовой);
-пул не пустой и без дублей серверов; `balance` — `round_robin`/`least_conn`;
-таймауты и `max_conns` неотрицательны; неизвестные ключи = ошибка загрузки.
+Правила: `version` строго `1`; имена listener'ов уникальны; адреса слушателей не
+дублируются (порт `0` исключён); `upstream_pool` обязан существовать;
+`addr`/`servers` — корректный `host:port` (порт числовой); пул не пустой и без
+дублей серверов; `balance` — `round_robin`/`least_conn`; таймауты и `max_conns`
+неотрицательны; неизвестные ключи = ошибка загрузки.
 
 > **`idle_timeout` и zero-copy.** `idle_timeout: 0` (по умолчанию) сохраняет
 > zero-copy `splice`. При `idle_timeout > 0` включается буферизованное копирование
-> с read-deadline (splice для этого направления отключается) — зато полу-открытые
-> «молчащие» соединения сбрасываются. В проде `idle_timeout` лучше задать.
+> с общим watchdog'ом на всё соединение: дедлайн сдвигается при активности **любого**
+> из направлений, поэтому долгая односторонняя передача (медленное скачивание, SSE)
+> не рвётся, а «молчащие» полу-открытые соединения сбрасываются. В проде
+> `idle_timeout` лучше задать.
 
 ---
 
 ## 10. Рецепты: «как добавить X»
 
 ### 10.1. Новое поле конфига
-1. Добавь поле с yaml-тегом в `internal/config/config.go`.
-2. Задай дефолт/проверку в `applyDefaultsAndValidate`.
+1. Добавь поле с yaml-тегом в нужный объект: `listener_config.go` для
+   `listeners[]`, `pool_config.go` для `pools`.
+2. Задай дефолт/проверку в методе `Validate` своего типа: `ListenerConfig`
+   для `listeners[]`, `PoolConfig` для `pools`. `Config.Validate` остаётся
+   единственным входом и добавляет только кросс-полевые правила (уникальность
+   имён/адресов, ссылки на пулы).
 3. Используй в `proxy` (значение едет внутри `Snapshot`).
 4. Обнови `configs/wasmgate.yaml` и `docs/`.
 
 ### 10.2. Новая стратегия балансировки
 1. В `internal/proxy/upstream.go` реализуй `Balancer` (`Next`, `Name`).
 2. Добавь ветку в `newBalancer`.
-3. Разреши значение в валидации (`config.go`, switch `Balance`).
+3. Разреши значение в валидации (`pool_config.go`, switch `Balance`).
 4. Добавь тест в `proxy_test.go`.
 
 ### 10.3. Rate-limit на скользящем окне (первая фича ядра)
-- Создай `internal/ratelimit` (ring-бакеты + шарды, без аллокаций).
-- В `proxy.go` на метке `// --- FUTURE: DDoS ... ---` вызови проверку **до** dial.
+- Создай `internal/ratelimit` (ring-бакеты + шарды, без аллокаций). Окна/счётчики
+  положи в `registry` (`state.go`), а не в snapshot, — иначе reload будет их сбрасывать.
+- В `proxy.go` на метке `// --- FUTURE: connection-flood ... ---` вызови проверку **до** dial.
 - Конфиг: `listeners[].rate_limit` (порог, окно) → поле в `ListenerConfig`.
+- Отказы логируй через `observe.NewLimiter(...)`, чтобы не получить «шторм» логов.
 - Бенчмарк: `go test -bench -benchmem ./internal/ratelimit` → цель `0 allocs/op`.
 
 ### 10.4. WASM-хуки плагинов (киллер-фича)
@@ -400,11 +495,22 @@ pools:
 ## 11. Как писать тесты
 
 - Юнит-тесты — **table-driven**, там же, где код (`*_test.go`).
+- **Имя тестового файла = имя исходника, который он покрывает**: `server.go` →
+  `server_test.go`, `upstream.go` → `upstream_test.go`. Общие фикстуры, нужные
+  больше чем одному файлу, — в `helpers_test.go`. Файл растёт вширь не строками,
+  а новыми файлами: не сваливай тесты всех исходников в один `proxy_test.go`.
 - Внешние тесты (через публичный API) — пакет `foo_test`.
 - Интеграция: `startEcho(t)` поднимает TCP-эхо, дальше проверяем проксирование
   (см. `TestProxyForwardsBytes`).
 - Для конфигов — `t.TempDir()` + временный файл (см. `config_test.go`).
 - Всегда закрывай ресурсы через `t.Cleanup`.
+- Бенчмарки — `BenchmarkXxx(b *testing.B)` в `*_test.go` (в бинарь не попадают),
+  в том же `X_test.go`, что и тесты исходника: сначала тесты, ниже бенчи,
+  отдельных `*_bench_test.go` и подпапок `bench/` не заводим. Полный список —
+  `benchmarks/README.md`.
+- Если бенчмарк меряет то, что читают все горутины (атомики, мьютекс, общий пул),
+  нужен парный `BenchmarkXxxParallel` через `b.RunParallel`: одиночный прогон не
+  создаёт конкуренции и цена общей кэш-линии в нём не видна.
 - Полезно: `go test -run ... -count=1 -v`.
 
 ---
@@ -431,7 +537,9 @@ pools:
 | `invalid duration "60"` | Нужна единица: `60s`, `1500ms` |
 | Импорты не находятся после смены пути модуля | `go mod tidy` |
 | `SIGHUP` ничего не делает на Windows | Ожидаемо — reload только на Unix |
-| Тест/соединение «висит» | Полу-открытое соединение без трафика. Задай `idle_timeout > 0` (включает буферизованный путь с read-deadline) |
+| Тест/соединение «висит» | Полу-открытое соединение без трафика. Задай `idle_timeout > 0` (буферизованный путь с общим watchdog'ом) |
+| После reload «пропали» соединения на старом порту | Слушатель переименован или сменил адрес: `Reload` закрывает прежний сокет и открывает новый. Смена адреса без перезапуска поддержана |
+| В логе мало строк `connection limit reached` / `dial upstream failed` | Включён anti-storm лимитер (см. `observe/limiter.go`); рядом появляется `suppressed=N` |
 
 ---
 

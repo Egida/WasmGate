@@ -93,7 +93,7 @@ accept()
 
 | Уровень | Что видим | Что делаем | Где в проекте |
 |---------|-----------|------------|---------------|
-| **L4 (ядро)** | TCP-соединения, IP/порт | route/балансировка, DDoS по частоте соединений, copy | сейчас (MVP + F2) |
+| **L4 (ядро)** | TCP-соединения, IP/порт | route/балансировка, rate limiting по частоте соединений (connection flood), copy | сейчас (MVP + F2) |
 | **Поток (L7-lite)** | байты TCP-потока (**не** пакеты) | SNI-peek, `on_data`-хуки плагинов, DPI JSON | хуки F1, F3 (future) |
 | **Пакеты (L3/L4)** | отдельные сетевые пакеты | раннее отсечение SYN-flood и подобного в ядре ОС | F4 eBPF (future) |
 
@@ -170,9 +170,9 @@ linters:
 wasmgate/                         # ← фактическая структура репозитория
 ├── cmd/wasmgate/                 # бинарь data plane (+ signals_unix/windows.go)
 ├── internal/
-│   ├── config/                   # схема YAML, Load(), Duration, валидация
-│   ├── proxy/                    # data plane: server, proxy, pool, upstream, copy, snapshot
-│   └── observe/                  # логирование (log/slog)
+│   ├── config/                   # схема YAML, Load()/Validate(), валидация
+│   ├── proxy/                    # data plane: server, proxy, pool, upstream, state, copy, snapshot
+│   └── observe/                  # логирование (log/slog) + ограничитель частоты
 ├── configs/                      # примеры конфигурации (wasmgate.yaml, local-echo.yaml)
 ├── plugins/examples/             # (future) примеры плагинов: rust, csharp, tinygo
 ├── benchmarks/                   # (future) скрипты нагрузки (wrk2, k6, vegeta)
@@ -283,12 +283,13 @@ if err := dialUpstream(ctx, addr); err != nil {
 type Snapshot struct {
     Version   uint64
     Config    *config.Config              // листенеры + пулы (данные из YAML)
-    listeners map[string]resolvedListener // листенер → пул + лимит соединений
+    listeners map[string]resolvedListener // листенер → пул + лимитер соединений
 }
 
 type Runtime struct {
-    cur atomic.Pointer[Snapshot]
-    mu  sync.Mutex // сериализует Reload: версия — read-modify-write
+    cur      atomic.Pointer[Snapshot]
+    mu       sync.Mutex // сериализует Reload: версия — read-modify-write
+    registry *registry  // состояние, живущее дольше snapshot (см. ниже)
 }
 
 // Load — один атомарный load; вызывается на КАЖДОМ соединении.
@@ -298,11 +299,17 @@ func (r *Runtime) Load() *Snapshot { return r.cur.Load() }
 func (r *Runtime) Reload(cfg *config.Config) uint64 {
     r.mu.Lock()
     defer r.mu.Unlock()
-    next := buildSnapshot(r.cur.Load().Version+1, cfg)
+    next := r.build(r.cur.Load().Version+1, cfg)
     r.cur.Store(next) // RCU: старые читатели держат прошлый, новые видят новый
     return next.Version
 }
 ```
+
+> **Что НЕ кладём в snapshot.** Всё, что зависит от истории — счётчик активных
+> соединений листенера (`max_conns`) и счётчики `active` у бэкендов — живёт в
+> `registry` (`internal/proxy/state.go`), который переживает reload. Иначе каждый
+> reload обнулял бы лимит (N reload — N лимитов) и ломал `least_conn`. Snapshot
+> хранит только неизменяемую конфигурацию и ссылки на эти долгоживущие объекты.
 
 > Сама замена указателя атомарна и в блокировке не нуждается, но **инкремент
 > версии** — это read-modify-write: без `mu` два одновременных reload могли бы
@@ -314,12 +321,20 @@ func (r *Runtime) Reload(cfg *config.Config) uint64 {
 > богатая) форма `Snapshot` добавит `Routes` (маршруты по SNI), `Limits`
 > (политики DDoS) и `Plugins` (активные версии WASM), но механизм ровно тот же.
 
+**Reconcile слушателей.** `Start` открывает порты; `Server.Reload` при смене
+конфига добавляет новые адреса, закрывает удалённые и **не трогает** неизменённые.
+Порядок безопасен: сначала биндятся новые сокеты, при ошибке — откат без
+публикации snapshot; затем публикуется snapshot; затем стартуют accept-loop'ы
+новых адресов; затем закрываются старые сокеты.
+
 **Drain-политика:**
 
 - новые соединения получают **новый** snapshot;
 - уже установленные — доживают на **своём** snapshot'е (без принудительного
-  разрыва), с опциональным grace-таймаутом;
-- при ошибке применения — **откат** на N-1 (snapshot всегда доступен).
+  разрыва), пока не истечёт `-shutdown-grace`; только после этого они закрываются
+  принудительно (и `Shutdown` возвращает ошибку таймаута);
+- при ошибке применения (валидация, занятый адрес) — прежняя конфигурация
+  остаётся активной целиком (**откат**: snapshot всегда доступен).
 
 **Поток применения:**
 
@@ -333,10 +348,20 @@ DP: Apply(snapshot) → atomic store → ack → метрика wasmgate_config_
 
 ---
 
-## 8. «Умная» защита от DDoS (скользящее окно)
+## 8. Защита от всплесков соединений (скользящее окно)
+
+**Область применимости (честно).** Проверка выполняется **после `accept()`**, то
+есть в user-space. Это защита от *connection flood* (много соединений в единицу
+времени), а **не** от объёмных атак: SYN-flood и подобное гасится ядром ОС до
+`accept()`, и для этого нужен отдельный слой (eBPF/XDP — F4). В тексте ВКР это
+надо называть именно rate limiting'ом соединений, а не «DDoS-защитой» целиком.
 
 **Задача:** в hot path считать частоту событий (accept/conns/data) по ключу
 (IP / /24-подсеть) за окно времени и принимать вердикт **без блокировок**.
+
+> Состояние окон живёт в `registry` (как `max_conns`), а не в snapshot, — иначе
+> reload сбрасывал бы накопленные счётчики, открывая ту же дыру, что и со
+> сбросом лимита соединений.
 
 **Алгоритм:** *sliding window* на кольцевых бакетах (bucketed ring counter) —
 комбинация точности и скорости.
@@ -381,7 +406,13 @@ type Window struct {
 | ADR-3 | Snapshot + `atomic.Pointer` для reload | double-buffer с мьютексом | non-blocking RCU, 0 разрывов | Accepted |
 | ADR-4 | C# control plane + gRPC/UDS | REST, файл+watch, Go control plane | строгий контракт, быстрый локальный канал | Accepted |
 | ADR-5 | Стек стартует как **L4 (TCP)** | сразу L7 HTTP | быстрее получить baseline-перф | Accepted |
-| ADR-6 | В ядро первой волной — **DDoS sliding window**; Hot Reload-каркас уже заложен; DPI JSON и eBPF — future work | всё сразу | фокус и измеримость | Accepted |
+| ADR-6 | В ядро первой волной — **защита от connection flood (sliding window)**; Hot Reload уже реализован; DPI JSON и eBPF — future work | всё сразу | фокус и измеримость | Accepted |
+
+> **ADR-4, оговорка.** Второй рантайм (.NET) ради управления версиями конфига —
+> это осознанный overhead: он оправдан, только если нужен **строгий контракт**
+> (protobuf/gRPC), реестр версий и аудит «из коробки», и если у команды есть
+> компетенция в .NET. Иначе тот же контур дешевле сделать на Go или «файл +
+> watch». В ВКР это стоит защищать именно так, а не как «так модно».
 
 ---
 

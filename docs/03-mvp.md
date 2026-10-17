@@ -30,10 +30,10 @@
 | 1 | Приём TCP-соединений (`net`, горутина на соединение; epoll под капотом) | ✅ M0 |
 | 2 | Проксирование на upstream-пул (bidirectional copy, `splice` на Linux) | ✅ M1 |
 | 3 | Балансировка: round-robin / least-conn | ✅ M1 |
-| 4 | Таймауты: connect, **idle**; лимит **`max_conns`** | ✅ M2 |
+| 4 | Таймауты: connect, **idle** (общий для соединения); лимит **`max_conns`** | ✅ M2 |
 | 5 | **TLS passthrough** через SNI-peek (без терминации); опц. терминация | ⏳ план |
 | 6 | Health-checks (активный TCP-connect + пассивный по ошибкам) | ⏳ план |
-| 7 | Конфиг из YAML + **hot reload** (SIGHUP — прообраз RCU) | ✅ M2 (каркас) |
+| 7 | Конфиг из YAML + **hot reload** (SIGHUP — прообраз RCU), reconcile слушателей | ✅ M2 |
 | 8 | Наблюдаемость: структурные логи (`log/slog`) есть; метрики/`pprof` — M3 | 🟡 частично |
 | 9 | Graceful shutdown & **drain** (перестаём принимать, доигрываем активные) | ✅ M2 |
 | 10 | CLI `wasmgate-ctl` (валидация/применение конфига) | ⏳ план |
@@ -48,8 +48,8 @@
 - ❌ Маркетплейс плагинов, GUI, multi-tenant.
 
 > Причина такого деления: сначала получить **воспроизводимый baseline** и
-> **не раздувать ядро**, а фичи ядра (Hot Reload / DDoS) добавлять поверх, не
-> ломая замеренные цифры.
+> **не раздувать ядро**, а фичи ядра (Hot Reload / защита от connection flood)
+> добавлять поверх, не ломая замеренные цифры.
 
 ---
 
@@ -82,7 +82,7 @@ clients ─▶ accept-loop ─▶ balancer ─▶ upstream pool ─▶ copy/spli
 ```
 internal/
 ├── proxy/       # server, proxy.Handle, pool, balancer, copy/splice, snapshot (RCU)
-├── config/      # схема YAML, загрузчик, Duration, валидация (чистые данные)
+├── config/      # схема YAML, загрузчик, Validate(), валидация (чистые данные)
 └── observe/     # логирование (log/slog); метрики/pprof — M3
 # future: ratelimit/ (DDoS), plugin/ (wazero), tlspeek/ (SNI), control/ (gRPC)
 ```
@@ -138,11 +138,11 @@ upstream_pools:
 |-----------|------------|-------------|-----|
 | **M0. Skeleton** | accept-loop (`net`), логирование, каркас | Бинарь принимает соединения | ✅ done |
 | **M1. Proxy core** | пулы, балансировка, copy/splice, таймауты | Проксирует TCP end-to-end | ✅ done |
-| **M2. Config+reload+drain** | YAML, Snapshot, atomic swap, SIGHUP, drain | Reload без разрыва соединений | 🟡 каркас готов |
+| **M2. Config+reload+drain** | YAML, Snapshot, atomic swap, SIGHUP, reconcile слушателей, drain | Reload без разрыва соединений | ✅ done |
 | **M3. Observe+hardening** | метрики, pprof, health-checks, CLI | Наблюдаемый прокси | ⏳ baseline |
 
-> **После M3** — ядровые фичи: DDoS sliding window (F2), затем WASM host +
-> C# Control Plane (F1); DPI (F3) и eBPF (F4) — future work.
+> **После M3** — ядровые фичи: защита от connection flood (F2, скользящее окно),
+> затем WASM host + C# Control Plane (F1); DPI (F3) и eBPF (F4) — future work.
 
 ---
 
@@ -250,7 +250,7 @@ go tool pprof http://127.0.0.1:6060/debug/pprof/profile?seconds=30
 |------|-------------|---------|-----------|
 | Движок event-loop (`gnet`) добавляет сложность, если взять его преждевременно | Средняя | Среднее | Решено: старт на `net`+`splice`; `gnet` — только если замеры покажут узкое место |
 | Drain/reload рвёт соединения на гонках | Средняя | Высокое | Chaos-тест + race; фиксировать snapshot per-conn |
-| `splice` не кросс-платформенный | Высокая | Низкое | Linux — fast path; иначе `io.Copy` |
+| `splice` не кросс-платформенный | Высокая | Низкое | Linux — fast path; на других платформах копия через пул буферов (подробно — benchmarks/README.md) |
 | Baseline «загрязнён» окружением | Средняя | Среднее | pinning, netns, ≥5 прогонов, benchstat |
 | Разрастание скоупа (feature creep) | Высокая | Среднее | Жёсткий scope §2.2 + milestones |
 
