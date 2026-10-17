@@ -118,7 +118,7 @@ accept()
 | Слой | Выбор | Почему | Альтернативы (и почему нет) |
 |------|-------|--------|------------------------------|
 | Networking (L4) | **стандартный `net`** (горутина на соединение) | Просто и предсказуемо; backpressure и per-conn состояние «из коробки»; под капотом epoll; `io.Copy` использует `splice(2)` | `gnet` (event-loop) — опция для миллионов лёгких соединений, но добавляет сложность; `fasthttp` — это HTTP |
-| Zero-copy | `splice` (Linux) через `net.TCPConn.ReadFrom` | Копирование данных в ядре, а не в user-space | ручные `io.Copy` (медленнее) — включаются, когда задан `idle_timeout` |
+| Zero-copy | `splice` (Linux) через `net.TCPConn.ReadFrom` | Копирование данных в ядре, а не в user-space | буферизованная копия из пула — включается при `idle_timeout > 0` (и вне Linux, ADR-7) |
 | WASM runtime | **`tetratelabs/wazero`** | Чистый Go, **нет CGO**, быстрый старт, sandbox, WASI | `wasmtime-go` (CGO), `wasmer-go` (CGO, тяжелее) |
 | JSON (future DPI) | `valyala/fastjson` / `bytedance/sonic` | Zero/низкие аллокации, SIMD (sonic) | `encoding/json` (рефлексия, аллокации) |
 | Config | `knadh/koanf` (или `yaml.v3` + `mapstructure`) | Лёгкий, без магии Viper | Viper (тяжелее) |
@@ -407,6 +407,7 @@ type Window struct {
 | ADR-4 | C# control plane + gRPC/UDS | REST, файл+watch, Go control plane | строгий контракт, быстрый локальный канал | Accepted |
 | ADR-5 | Стек стартует как **L4 (TCP)** | сразу L7 HTTP | быстрее получить baseline-перф | Accepted |
 | ADR-6 | В ядро первой волной — **защита от connection flood (sliding window)**; Hot Reload уже реализован; DPI JSON и eBPF — future work | всё сразу | фокус и измеримость | Accepted |
+| ADR-7 | Релей: на Linux — `io.Copy` → `splice(2)`; вне Linux — стандартная петля `io.CopyBuffer` с буфером из пула, выбор по одной проверке `runtime.GOOS` в `copyPlain` | build-теги (`copy_linux.go`/`copy_other.go`); свой цикл копирования; голый `io.Copy` везде | целевая платформа не тронута (splice, 0 аллокаций); в data plane нет своего цикла (это семантика stdlib); цена вне Linux — 4 wrapper'а ~100 B на соединение против 64 KiB у голого `io.Copy`; выбор платформы остаётся в одном файле; цены и альтернативы — benchmarks/README.md, §«Платформа» | Accepted (было: сплит по build-тегам) |
 
 > **ADR-4, оговорка.** Второй рантайм (.NET) ради управления версиями конфига —
 > это осознанный overhead: он оправдан, только если нужен **строгий контракт**
