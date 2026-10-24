@@ -1,0 +1,33 @@
+# Benchmark runner, started manually (Actions tab -> "Benchmarks" -> Run).
+#
+# Why manual and not on every push: benchmark numbers on shared GitHub runners
+# are noisy, so an automatic per-commit comparison would mostly measure the
+# neighbour workloads. The intended use is deliberate measurement points:
+# before/after a hot-path change, or the Linux numbers for the thesis, with
+# benchstat comparing two downloaded artifacts.
+#
+# The result file uses the standard `go test -bench` text format accepted by
+# benchstat: download two runs, then `benchstat old.txt new.txt`.
+name: Benchmarks
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    name: go test -bench (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Run benchmarks
+        run: go test -run '^$' -bench . -benchmem -count=6 ./... | tee bench-linux.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bench-linux
+          path: bench-linux.txt

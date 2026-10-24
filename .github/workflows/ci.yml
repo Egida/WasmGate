@@ -1,0 +1,74 @@
+# CI: format/vet/lint plus the test matrix.
+#
+# Two jobs:
+#   lint — fails on any unformatted file (gofmt), go vet, golangci-lint.
+#          The lint version is pinned to the last v1.x release because
+#          .golangci.yml targets the v1 configuration schema.
+#   test — race-enabled tests on Linux (gcc is present there, so CGO for the
+#          race detector costs nothing; locally on Windows it needs mingw).
+#          Windows runs the plain test suite: it exercises the platform's
+#          signal handling and copy path, which differ from Unix.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel the in-flight run of the same branch when a new push arrives: only
+# the newest commit matters.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint (gofmt + vet + golangci-lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod # keeps CI on the toolchain go.mod declares
+
+      - name: Check gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files need gofmt -w:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: v1.64.8 # .golangci.yml uses the v1 schema
+
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false # let the other OS finish even if one fails
+      matrix:
+        include:
+          - os: ubuntu-latest
+            race: -race
+          - os: windows-latest
+            race: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: go test
+        run: go test ${{ matrix.race }} ./...
+
+      - name: go build
+        run: go build ./...
