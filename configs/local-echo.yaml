@@ -7,6 +7,9 @@
 #   go run ./cmd/wasmgate -config configs/local-echo.yaml -log-level debug
 version: 1
 
+# Watch the proxy while smoke-testing: curl http://127.0.0.1:9098/metrics
+admin_addr: "127.0.0.1:9098"
+
 listeners:
   - name: echo
     addr: "127.0.0.1:8080"

@@ -25,6 +25,7 @@
 | `BenchmarkLoadInvalid/{unknown_field,duplicate_addr,bad_listener_addr,error_in_last_listener}` | `internal/config` (`config_test.go`) | путь **отказа** reload: битый YAML, битый адрес, ошибка в последнем листенере большого файла | `ns/op` |
 | `BenchmarkLimiterAllow`, `BenchmarkLimiterAllowManyKeys` | `internal/observe` (`limiter_test.go`) | лог-лимитер на пути ошибок | `ns/op`, `allocs/op` |
 | `BenchmarkLimiterAllowParallel/{shared_key,distinct_keys}` | `internal/observe` (`limiter_test.go`) | лог-лимитер, когда его дёргают все P сразу (один ключ против своих у каждого) | `ns/op` |
+| `BenchmarkMetricsConnection`, `BenchmarkMetricsConnectionParallel` | `internal/observe` (`metrics_test.go`) | всю учётную работу метрик на соединение (Accept + AddBytes ×2 + Close) | `ns/op`, `allocs/op` |
 
 > Подпапок `bench/` нет. Тесты и бенчи лежат вместе, в `X_test.go` того исходника,
 > который покрывают (`copy.go` → `copy_test.go`), тесты сверху, бенчи ниже — так

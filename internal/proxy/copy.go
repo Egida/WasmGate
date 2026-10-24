@@ -6,6 +6,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -46,7 +47,11 @@ var bufferPool = sync.Pool{
 //
 // On a hard error (reset, idle timeout, ...) BOTH sides are closed, so the peer
 // direction can never stay blocked on a half-open connection.
-func join(ctx context.Context, a, b net.Conn, idle time.Duration) {
+//
+// join returns the number of bytes relayed in each direction (a<-b, b<-a). The
+// totals come from io.Copy's own return value, so counting them costs nothing
+// per chunk — one atomic add per finished direction is the whole price.
+func join(ctx context.Context, a, b net.Conn, idle time.Duration) (int64, int64) {
 	// When ctx is cancelled (e.g. server shutdown), close both sides so the copy
 	// goroutines unblock and wg.Wait returns.
 	stop := context.AfterFunc(ctx, func() {
@@ -55,20 +60,24 @@ func join(ctx context.Context, a, b net.Conn, idle time.Duration) {
 	})
 	defer stop()
 
+	var fwd, rev atomic.Int64
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go pipe(&wg, a, b, idle) // a <- b
-	go pipe(&wg, b, a, idle) // b <- a
+	go pipe(&wg, a, b, idle, &fwd) // a <- b
+	go pipe(&wg, b, a, idle, &rev) // b <- a
 	wg.Wait()
+	return fwd.Load(), rev.Load()
 }
 
 // pipe copies src -> dst until EOF or error, then reports completion via wg.
 // A clean EOF half-closes dst's write side; any other outcome tears down both
 // connections so the peer direction cannot stay blocked.
-func pipe(wg *sync.WaitGroup, dst, src net.Conn, idle time.Duration) {
+func pipe(wg *sync.WaitGroup, dst, src net.Conn, idle time.Duration, total *atomic.Int64) {
 	defer wg.Done()
 
-	if err := copyConn(dst, src, idle); err != nil {
+	n, err := copyConn(dst, src, idle)
+	total.Add(n)
+	if err != nil {
 		// Hard error or idle timeout: close both sides. Close is safe to call
 		// from either pipe (the other one will simply observe a closed conn).
 		_ = dst.Close()
@@ -79,8 +88,8 @@ func pipe(wg *sync.WaitGroup, dst, src net.Conn, idle time.Duration) {
 }
 
 // copyConn copies src -> dst, choosing the zero-copy path when idle is disabled
-// and the idle-aware buffered path otherwise.
-func copyConn(dst, src net.Conn, idle time.Duration) error {
+// and the idle-aware buffered path otherwise. It returns the bytes relayed.
+func copyConn(dst, src net.Conn, idle time.Duration) (int64, error) {
 	if idle <= 0 {
 		return copyPlain(dst, src)
 	}
@@ -101,15 +110,13 @@ func copyConn(dst, src net.Conn, idle time.Duration) error {
 //
 // What remains is two interface wrappers per connection, ~64 B: the whole
 // price of the pool.
-func copyPlain(dst, src net.Conn) error {
+func copyPlain(dst, src net.Conn) (int64, error) {
 	if runtime.GOOS == "linux" {
-		_, ioErr := io.Copy(dst, src)
-		return ioErr
+		return io.Copy(dst, src)
 	}
 	bufp := bufferPool.Get().(*[]byte)
 	defer bufferPool.Put(bufp)
-	_, err := io.CopyBuffer(struct{ io.Writer }{dst}, struct{ io.Reader }{src}, *bufp)
-	return err
+	return io.CopyBuffer(struct{ io.Writer }{dst}, struct{ io.Reader }{src}, *bufp)
 }
 
 // copyWatched copies src -> dst through a pooled buffer while refreshing the
@@ -117,12 +124,11 @@ func copyPlain(dst, src net.Conn) error {
 // watchdog: with idle > 0 every chunk must be inspected anyway, so splice
 // stays out of reach by construction (the source is an activityReader and the
 // destination is handed over as a bare io.Writer).
-func copyWatched(dst, src net.Conn, idle time.Duration) error {
+func copyWatched(dst, src net.Conn, idle time.Duration) (int64, error) {
 	bufp := bufferPool.Get().(*[]byte)
 	defer bufferPool.Put(bufp)
 	r := &activityReader{conn: src, peer: dst, idle: idle}
-	_, err := io.CopyBuffer(struct{ io.Writer }{dst}, r, *bufp)
-	return err
+	return io.CopyBuffer(struct{ io.Writer }{dst}, r, *bufp)
 }
 
 // activityReader refreshes a read deadline on BOTH endpoints before its source

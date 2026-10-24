@@ -99,6 +99,52 @@ pools:
 	}
 }
 
+// TestLoadAdminAddr covers the optional observability listener: a valid
+// admin_addr loads and round-trips, a malformed one is rejected with the field
+// named in the error.
+func TestLoadAdminAddr(t *testing.T) {
+	path := write(t, `
+version: 1
+admin_addr: "127.0.0.1:9099"
+listeners:
+  - name: edge
+    addr: "127.0.0.1:0"
+    upstream_pool: web
+pools:
+  web:
+    servers: ["127.0.0.1:9000"]
+`)
+	cfg, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("load with admin_addr: %v", err)
+	}
+	if cfg.AdminAddr != "127.0.0.1:9099" {
+		t.Fatalf("admin_addr = %q, want 127.0.0.1:9099", cfg.AdminAddr)
+	}
+
+	for _, bad := range []string{`admin_addr: "no-port"`, `admin_addr: "127.0.0.1:http"`} {
+		path := write(t, `
+version: 1
+`+bad+`
+listeners:
+  - name: edge
+    addr: "127.0.0.1:0"
+    upstream_pool: web
+pools:
+  web:
+    servers: ["127.0.0.1:9000"]
+`)
+		_, err := config.Load(path)
+		if err == nil {
+			t.Errorf("load with %q: expected error, got nil", bad)
+			continue
+		}
+		if !strings.Contains(err.Error(), "admin_addr") {
+			t.Errorf("load with %q: error does not name admin_addr: %v", bad, err)
+		}
+	}
+}
+
 func TestLoadMissingFileFails(t *testing.T) {
 	if _, err := config.Load(filepath.Join(t.TempDir(), "absent.yaml")); err == nil {
 		t.Fatal("Load of a missing file returned nil, want an error")

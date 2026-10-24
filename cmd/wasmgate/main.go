@@ -46,13 +46,35 @@ func run() error {
 		return err
 	}
 
+	metrics := observe.NewMetrics()
 	rt := proxy.NewRuntime(cfg)
-	srv := proxy.NewServer(log, rt)
+	srv := proxy.NewServer(log, rt, metrics)
 
 	if err := srv.Start(); err != nil {
 		return err
 	}
 	log.Info("wasmgate started", "config_version", rt.Load().Version)
+
+	// The admin endpoint (metrics, healthz, pprof) is optional: it runs on its
+	// own listener only when admin_addr is configured, so the data-plane accept
+	// path never handles an HTTP request. Binding happens here, before Serve, so
+	// a busy port fails startup instead of surfacing later from a goroutine.
+	var admin *observe.Admin
+	if cfg.AdminAddr != "" {
+		admin, err = observe.NewAdmin(cfg.AdminAddr, metrics, rt.UpstreamStats, log)
+		if err != nil {
+			return err
+		}
+		go func() {
+			if err := admin.Serve(); err != nil {
+				log.Error("admin endpoint stopped", "err", err)
+			}
+		}()
+		log.Info("admin endpoint listening",
+			"addr", admin.Addr().String(),
+			"endpoints", "/metrics /healthz /debug/pprof/",
+		)
+	}
 
 	// Build the set of signals: shutdown signals plus (on Unix) SIGHUP for reload.
 	reload := reloadSignal()
@@ -83,6 +105,9 @@ func run() error {
 		log.Info("shutting down", "signal", s.String())
 		shutCtx, shutCancel := context.WithTimeout(context.Background(), *shutdownGrace)
 		err := srv.Shutdown(shutCtx)
+		if admin != nil {
+			_ = admin.Shutdown(shutCtx)
+		}
 		shutCancel()
 		if err != nil {
 			log.Warn("connections force-closed after grace expired", "err", err)

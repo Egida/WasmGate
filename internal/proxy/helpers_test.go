@@ -130,7 +130,7 @@ func startServer(tb testing.TB, srv *Server) string {
 // proxy's listen address plus the server handle.
 func newTestServer(t *testing.T, mutate func(*config.ListenerConfig)) (string, *Server) {
 	t.Helper()
-	srv := NewServer(testLogger(), NewRuntime(edgeConfig([]string{startEcho(t)}, mutate)))
+	srv := NewServer(testLogger(), NewRuntime(edgeConfig([]string{startEcho(t)}, mutate)), nil)
 	return startServer(t, srv), srv
 }
 
@@ -142,7 +142,21 @@ func startProxy(tb testing.TB, backend string, idle time.Duration) string {
 	cfg := validated(tb, edgeConfig([]string{backend}, func(lc *config.ListenerConfig) {
 		lc.IdleTimeout = idle
 	}))
-	return startServer(tb, NewServer(testLogger(), NewRuntime(cfg)))
+	return startServer(tb, NewServer(testLogger(), NewRuntime(cfg), nil))
+}
+
+// waitMetric polls cond until it reports true or the deadline expires, failing
+// the test on timeout. Metrics are updated from the connection goroutines, so a
+// test that just closed its socket must give them a moment to land.
+func waitMetric(t *testing.T, deadline time.Duration, cond func() bool) {
+	t.Helper()
+	end := time.Now().Add(deadline)
+	for !cond() {
+		if time.Now().After(end) {
+			t.Fatal("metrics did not settle in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // roundTrip opens a connection, sends one byte and waits for the echoed byte.

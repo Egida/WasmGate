@@ -4,6 +4,11 @@
 # and forwards them to one of the backends in the referenced pool.
 version: 1
 
+# Optional observability endpoint: /metrics (Prometheus text), /healthz and
+# /debug/pprof/. Keep it on loopback unless you really want it exposed.
+# Empty or omitted = disabled.
+admin_addr: "127.0.0.1:9099"
+
 listeners:
   - name: edge
     addr: "127.0.0.1:8080"

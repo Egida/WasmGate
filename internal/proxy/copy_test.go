@@ -62,7 +62,7 @@ func TestIdleTimeoutKeepsOneWayStreamAlive(t *testing.T) {
 	cfg := edgeConfig([]string{backend}, func(lc *config.ListenerConfig) {
 		lc.IdleTimeout = 300 * time.Millisecond
 	})
-	srv := NewServer(testLogger(), NewRuntime(cfg))
+	srv := NewServer(testLogger(), NewRuntime(cfg), nil)
 	addr := startServer(t, srv)
 
 	conn := dial(t, addr)

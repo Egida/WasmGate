@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"wasmgate/internal/config"
+	"wasmgate/internal/observe"
 )
 
 // Server binds the configured listeners and dispatches accepted connections to
@@ -32,9 +33,10 @@ import (
 //   - mu guards the binding map and the started/closing flags. It is never
 //     touched on the accept/fast path.
 type Server struct {
-	log   *slog.Logger // structured logger
-	rt    *Runtime     // source of the current snapshot
-	proxy *Proxy       // shared by all accept loops
+	log     *slog.Logger     // structured logger
+	rt      *Runtime         // source of the current snapshot
+	proxy   *Proxy           // shared by all accept loops
+	metrics *observe.Metrics // per-connection counters; nil = disabled
 
 	mu      sync.Mutex
 	started bool
@@ -57,13 +59,15 @@ type boundListener struct {
 	ln      net.Listener
 }
 
-// NewServer builds a Server bound to the runtime rt.
-func NewServer(log *slog.Logger, rt *Runtime) *Server {
+// NewServer builds a Server bound to the runtime rt. metrics may be nil, which
+// disables the per-connection counters.
+func NewServer(log *slog.Logger, rt *Runtime, metrics *observe.Metrics) *Server {
 	connCtx, connCancel := context.WithCancel(context.Background())
 	return &Server{
 		log:        log,
 		rt:         rt,
-		proxy:      New(log, rt),
+		proxy:      New(log, rt, metrics),
+		metrics:    metrics,
 		ln:         make(map[string]boundListener),
 		connCtx:    connCtx,
 		connCancel: connCancel,
@@ -97,6 +101,7 @@ func (s *Server) Start() error {
 		s.startAccept(l.Name, sock, snap)
 	}
 	s.ln = ln
+	s.metrics.SetVersion(snap.Version)
 	return nil
 }
 
@@ -159,6 +164,7 @@ func (s *Server) Reload(ctx context.Context, cfg *config.Config) (uint64, error)
 	}
 
 	v := s.rt.Reload(cfg)
+	s.metrics.Reload(v)
 
 	snap := s.rt.Load()
 	for _, name := range opened {
@@ -215,9 +221,11 @@ func (s *Server) acceptLoop(name string, ln net.Listener) {
 			continue
 		}
 
+		s.metrics.Accept()
 		s.connWG.Add(1)
 		go func() {
 			defer s.connWG.Done()
+			defer s.metrics.Close()
 			// A panic in a handler (a bug, or later a WASM plugin) must not take
 			// down the whole proxy: contain it to this connection.
 			defer func() {

@@ -19,9 +19,10 @@ const ConfigVersion = 1
 
 // Config is the root of the configuration file.
 type Config struct {
-	Version   int                   `yaml:"version"`   // schema version (must be 1)
-	Listeners []ListenerConfig      `yaml:"listeners"` // front-facing TCP listeners
-	Pools     map[string]PoolConfig `yaml:"pools"`     // backend groups, keyed by pool name
+	Version   int                   `yaml:"version"`    // schema version (must be 1)
+	AdminAddr string                `yaml:"admin_addr"` // optional: /metrics, /healthz, pprof listener; empty = disabled
+	Listeners []ListenerConfig      `yaml:"listeners"`  // front-facing TCP listeners
+	Pools     map[string]PoolConfig `yaml:"pools"`      // backend groups, keyed by pool name
 }
 
 // Load reads, parses and validates the configuration file at path.
@@ -59,6 +60,14 @@ func (c *Config) Validate() error {
 	}
 	if len(c.Listeners) == 0 {
 		return errors.New("config: no listeners defined")
+	}
+	if c.AdminAddr != "" {
+		// Same shape as a listener address: host optional (binding it to
+		// loopback is the operator's choice), numeric port; port 0 is allowed
+		// so tests can take an ephemeral one.
+		if err := validateAddr(c.AdminAddr, false); err != nil {
+			return fmt.Errorf("config: admin_addr: %w", err)
+		}
 	}
 	if err := c.validateListeners(); err != nil {
 		return err

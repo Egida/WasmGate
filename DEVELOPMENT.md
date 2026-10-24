@@ -18,10 +18,12 @@ graceful shutdown (сначала перестаём принимать, зат�
 snapshot, **reconcile слушателей** (добавление/удаление адресов без перезапуска),
 сохранение счётчиков лимитов и балансировщика между reload, ограничение частоты
 «шумных» логов, строгая валидация конфига, структурные логи, сборка без CGO.
-Покрыто тестами (`go test ./...`).
+Метрики (Prometheus-текст, `/healthz`, `pprof`) — на отдельном admin-листенере
+`admin_addr` (опционально); счётчики — атомики, ~60 нс и 0 аллокаций на
+соединение. Покрыто тестами (`go test ./...`).
 
 **Ещё не реализовано:** защита от connection flood (rate-limit), WASM-плагины,
-SNI/TLS-peek, health-checks, метрики/pprof, CLI, нагрузочные бенчмарки. Куда
+SNI/TLS-peek, health-checks апстримов, CLI, нагрузочные бенчмарки. Куда
 встраивать — §10 «Рецепты».
 
 **Следующий шаг:** пакет `internal/ratelimit` (скользящее окно — первая фича
@@ -102,9 +104,13 @@ WasmGate/
 │   │   ├── pool_test.go     тесты pool.go: резервирование слотов
 │   │   └── helpers_test.go  общие фикстуры: echo, сервер, dial, конфиг, sinks
 │   └── observe/
-│       ├── log.go           конструктор логгера (log/slog)
+│       ├── log.go           ParseLevel + NewLogger (log/slog)
 │       ├── limiter.go       ограничитель частоты логов (анти-«шторм»)
+│       ├── metrics.go       счётчики соединений/байтов/reload (атомики) + рендер Prometheus
+│       ├── admin.go         admin-эндпоинт: /metrics, /healthz, /debug/pprof
 │       ├── limiter_test.go  тесты + бенчи лог-лимитера
+│       ├── metrics_test.go  тесты + бенчи метрик (цена на соединение)
+│       ├── admin_test.go    тесты эндпоинтов
 │       └── log_test.go      тесты разбора уровня логирования
 ├── configs/
 │   ├── wasmgate.yaml        основной пример
@@ -260,8 +266,14 @@ $env:GOOS="windows";$env:GOARCH="amd64"; go build -o bin/wasmgate.exe ./cmd/wasm
 
 ### 4.7. Профилирование (pprof)
 
-Живого HTTP-эндпоинта `/debug/pprof` пока нет (появится в milestone M3).
-Сейчас профилируем через тесты:
+Живой эндпоинт: задай `admin_addr` в конфиге — `/debug/pprof/` появится вместе
+с `/metrics` и `/healthz` (см. §9). Пример:
+
+```powershell
+go tool pprof http://127.0.0.1:9099/debug/pprof/profile?seconds=10
+```
+
+Без запущенного процесса профилируем через тесты:
 
 ```powershell
 go test -run '^$' -bench . -cpuprofile cpu.out ./internal/proxy
@@ -390,7 +402,15 @@ func (s *Server) Addrs() []net.Addr
 
 ### `internal/observe`
 
-`NewLogger(level)` — единая точка создания логгера (stdlib `log/slog`).
+- `ParseLevel(s) (slog.Level, error)` — разбор текстового уровня (граница:
+  флаг CLI/конфиг); внутри программы все ходят с `slog.Level`.
+- `NewLogger(level)` — единая точка создания логгера (stdlib `log/slog`).
+- `Metrics` — счётчики прокси (accepted/closed/active/rejected/dial-fail/bytes/
+  reloads/config_version + per-upstream active). Методы nil-безопасны и стоят
+  ~60 нс / 0 аллокаций на соединение; `WritePrometheus` — холодный путь.
+- `Admin` — опциональный admin-листенер (`admin_addr`): `/metrics` (Prometheus
+  text), `/healthz` (JSON), `/debug/pprof/*`. Биндится синхронно при старте,
+  `Serve()` — блокирующий, `Shutdown(ctx)` — graceful.
 
 ### `cmd/wasmgate`
 
@@ -428,6 +448,9 @@ func (s *Server) Addrs() []net.Addr
 ```yaml
 version: 1
 
+admin_addr: "127.0.0.1:9099" # опционально: /metrics, /healthz, /debug/pprof
+                              # (пусто/отсутствует = выключен)
+
 listeners:
   - name: edge              # уникальное имя (используется в логах/роутинге)
     addr: "127.0.0.1:8080"  # адрес прослушивания
@@ -444,7 +467,8 @@ pools:
       - "127.0.0.1:9002"
 ```
 
-Правила: `version` строго `1`; имена listener'ов уникальны; адреса слушателей не
+Правила: `version` строго `1`; `admin_addr` опционален (корректный `host:port`);
+имена listener'ов уникальны; адреса слушателей не
 дублируются (порт `0` исключён); `upstream_pool` обязан существовать;
 `addr`/`servers` — корректный `host:port` (порт числовой); пул не пустой и без
 дублей серверов; `balance` — `round_robin`/`least_conn`; таймауты и `max_conns`

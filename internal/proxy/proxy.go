@@ -29,11 +29,14 @@ type Proxy struct {
 	log     *slog.Logger     // structured logger
 	rt      *Runtime         // source of the current snapshot
 	sampler *observe.Limiter // rate-limits per-connection log events
+	metrics *observe.Metrics // per-connection counters; nil = disabled
 }
 
 // New returns a Proxy that reads configuration from rt on every connection.
-func New(log *slog.Logger, rt *Runtime) *Proxy {
-	return &Proxy{log: log, rt: rt, sampler: observe.NewLimiter(logWindow, logBurst)}
+// metrics may be nil, which disables the per-connection counters (every Metrics
+// method is nil-safe).
+func New(log *slog.Logger, rt *Runtime, metrics *observe.Metrics) *Proxy {
+	return &Proxy{log: log, rt: rt, sampler: observe.NewLimiter(logWindow, logBurst), metrics: metrics}
 }
 
 // Handle proxies a single accepted client connection. It always closes client.
@@ -60,6 +63,7 @@ func (p *Proxy) Handle(ctx context.Context, listenerName string, client net.Conn
 	// Enforce the per-listener connection limit (nil limiter means unlimited).
 	if rl.limiter != nil {
 		if !rl.limiter.acquire() {
+			p.metrics.RejectLimit()
 			if ok, dropped := p.sampler.Allow("limit:" + listenerName); ok {
 				p.log.Warn("connection limit reached",
 					"listener", listenerName,
@@ -83,6 +87,7 @@ func (p *Proxy) Handle(ctx context.Context, listenerName string, client net.Conn
 	var d net.Dialer
 	server, err := d.DialContext(dialCtx, "tcp", up.addr)
 	if err != nil {
+		p.metrics.DialFail()
 		if ok, dropped := p.sampler.Allow("dial:" + listenerName + ":" + up.addr); ok {
 			p.log.Warn("dial upstream failed",
 				"listener", listenerName,
@@ -97,5 +102,6 @@ func (p *Proxy) Handle(ctx context.Context, listenerName string, client net.Conn
 
 	p.log.Debug("proxying", "listener", listenerName, "pool", rl.pool.Name(), "upstream", up.addr)
 
-	join(ctx, client, server, rl.cfg.IdleTimeout)
+	rx, tx := join(ctx, client, server, rl.cfg.IdleTimeout)
+	p.metrics.AddBytes(rx + tx)
 }

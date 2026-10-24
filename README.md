@@ -51,6 +51,9 @@ WasmGate проектируется как прокси-шлюз с расшир
   слушатели добавляются/удаляются без перезапуска, счётчики лимитов не сбрасываются.
 - Строгая валидация конфигурации.
 - Структурное логирование (`log/slog`) с ограничением частоты «шумных» событий.
+- Метрики в формате Prometheus (`/metrics`), `/healthz` и `net/http/pprof` на
+  отдельном admin-листенере (`admin_addr`, опционально). Счётчики — атомики,
+  одно обновление на соединение (не на чанк): ~60 нс и 0 аллокаций на соединение.
 - Сборка без CGO; юнит- и интеграционные тесты.
 
 ### Планируется
@@ -62,7 +65,7 @@ WasmGate проектируется как прокси-шлюз с расшир
 - Хуки плагинов WASM: `on_accept`, `on_data`, `on_close`.
 - TLS passthrough через SNI peek и опциональная терминация.
 - Health-checks upstream.
-- Метрики и `pprof`.
+- CLI.
 - C# control plane: версии конфигурации, публикация, откат.
 - DPI и eBPF (future work).
 
@@ -100,7 +103,7 @@ upstream pool
 | M0. Skeleton | accept-loop, логирование, каркас | бинарь принимает соединения | готово |
 | M1. Proxy core | пулы, балансировка, copy/splice, таймауты | проксирование TCP end-to-end | готово |
 | M2. Config + reload + drain | YAML, snapshot, atomic swap, SIGHUP, reconcile слушателей, drain | reload без разрыва соединений | готово |
-| M3. Observe + hardening | метрики, `pprof`, health-checks, CLI | наблюдаемый прокси | план |
+| M3. Observe + hardening | метрики, `pprof`, health-checks, CLI | наблюдаемый прокси | в работе (метрики/pprof есть, baseline-замеры впереди) |
 
 После M3 в ядро добавляется защита от connection flood (sliding window), затем WASM
 host и control plane. Drain и её соответствие требованиям проверяются chaos-тестом.
@@ -146,6 +149,10 @@ go run ./cmd/wasmgate -config configs/wasmgate.yaml
 ```yaml
 version: 1
 
+# Опционально: observability-эндпоинт (/metrics, /healthz, /debug/pprof/)
+# на отдельном listener'е; пусто или отсутствует = выключен.
+admin_addr: "127.0.0.1:9099"
+
 listeners:
   - name: edge
     addr: "127.0.0.1:8080"
@@ -165,6 +172,7 @@ pools:
 Правила:
 
 - `version` должен быть равен `1`;
+- `admin_addr` опционален: если задан — корректный `host:port` с числовым портом;
 - имена listeners уникальны, `upstream_pool` должен существовать;
 - `addr` и `servers` задаются как корректный `host:port` с числовым портом;
 - адреса слушателей не дублируются (адрес с портом `0` исключён: это «любой
@@ -189,7 +197,7 @@ zero-copy `splice`. При `idle_timeout > 0` включается буфери�
 cmd/wasmgate/        точка входа и обработка сигналов (unix/windows)
 internal/config/     схема YAML, загрузка, валидация
 internal/proxy/      ядро data plane: сервер, прокси, пулы, балансировщики, copy, snapshot
-internal/observe/    логирование (log/slog) и лог-лимитер
+internal/observe/    логирование (log/slog), лог-лимитер, метрики и admin-эндпоинт
 configs/             примеры конфигурации
 docs/                проектная документация
 plugins/             примеры плагинов (в разработке)

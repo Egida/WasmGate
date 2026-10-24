@@ -1,10 +1,12 @@
 package proxy
 
 import (
+	"sort"
 	"sync"
 	"sync/atomic"
 
 	"wasmgate/internal/config"
+	"wasmgate/internal/observe"
 )
 
 // resolvedListener is a listener pre-bound to its pool, so the data path
@@ -60,6 +62,21 @@ func NewRuntime(cfg *config.Config) *Runtime {
 
 // Load returns the current snapshot. Lock-free and allocation-free.
 func (r *Runtime) Load() *Snapshot { return r.cur.Load() }
+
+// UpstreamStats returns the live in-flight connection count per backend
+// address, sorted by address. Cold path (the admin /metrics endpoint): it takes
+// the registry lock and allocates, which the data path never does. The counts
+// come from the registry, so they cover every pool and survive reloads.
+func (r *Runtime) UpstreamStats() []observe.UpstreamStat {
+	r.registry.mu.Lock()
+	defer r.registry.mu.Unlock()
+	out := make([]observe.UpstreamStat, 0, len(r.registry.upstreams))
+	for addr, u := range r.registry.upstreams {
+		out = append(out, observe.UpstreamStat{Server: addr, Active: u.active.Load()})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Server < out[j].Server })
+	return out
+}
 
 // Reload compiles a new snapshot and publishes it, returning the new version.
 // Safe for concurrent use.

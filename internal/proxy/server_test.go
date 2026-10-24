@@ -9,10 +9,55 @@ import (
 	"time"
 
 	"wasmgate/internal/config"
+	"wasmgate/internal/observe"
 )
 
 // Tests for server.go: the Start / Reload / Shutdown lifecycle, followed by the
 // benchmark that measures session establishment.
+
+// TestServerMetricsCountConnectionLifecycle walks one connection through the
+// whole metrics path: accepted on Accept(), relayed bytes counted once per
+// finished direction (one byte each way here), active back to zero and closed
+// counted after the handler returns.
+func TestServerMetricsCountConnectionLifecycle(t *testing.T) {
+	m := observe.NewMetrics()
+	cfg := validated(t, edgeConfig([]string{startEcho(t)}, nil))
+	addr := startServer(t, NewServer(testLogger(), NewRuntime(cfg), m))
+
+	conn := roundTrip(t, addr) // writes one byte, reads the echoed byte back
+	_ = conn.Close()
+
+	waitMetric(t, 2*time.Second, func() bool {
+		s := m.Snapshot()
+		return s.ConnectionsAccepted == 1 &&
+			s.ConnectionsClosed == 1 &&
+			s.ConnectionsActive == 0 &&
+			s.RelayedBytes >= 2 // one byte in each direction
+	})
+	if s := m.Snapshot(); s.ConfigVersion != 1 {
+		t.Fatalf("config_version = %d, want 1 after Start", s.ConfigVersion)
+	}
+}
+
+// TestServerMetricsCountReload checks that a successful Reload bumps the reload
+// counter and publishes the new version into the metrics.
+func TestServerMetricsCountReload(t *testing.T) {
+	m := observe.NewMetrics()
+	srv := NewServer(testLogger(), NewRuntime(validated(t, edgeConfig([]string{startEcho(t)}, nil))), m)
+	addr := startServer(t, srv)
+
+	v, err := srv.Reload(context.Background(), validated(t, edgeConfig([]string{startEcho(t)}, nil)))
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	waitMetric(t, 2*time.Second, func() bool {
+		s := m.Snapshot()
+		return s.Reloads == 1 && s.ConfigVersion == v
+	})
+
+	c := roundTrip(t, addr) // still serving after the reload
+	_ = c.Close()
+}
 
 // TestShutdownDrainsActiveConnection checks that graceful shutdown does NOT
 // tear down an established connection: it must keep working while Shutdown
@@ -76,7 +121,7 @@ func TestShutdownForceClosesAfterGrace(t *testing.T) {
 // TestServerStartTwiceFails checks that Start is not idempotent: a second call
 // must report an error instead of silently rebinding.
 func TestServerStartTwiceFails(t *testing.T) {
-	srv := NewServer(testLogger(), NewRuntime(edgeConfig([]string{"127.0.0.1:9000"}, nil)))
+	srv := NewServer(testLogger(), NewRuntime(edgeConfig([]string{"127.0.0.1:9000"}, nil)), nil)
 	startServer(t, srv)
 
 	if err := srv.Start(); err == nil {
@@ -88,7 +133,7 @@ func TestServerStartTwiceFails(t *testing.T) {
 // is refused rather than half-applied.
 func TestReloadBeforeStartFails(t *testing.T) {
 	cfg := edgeConfig([]string{"127.0.0.1:9000"}, nil)
-	srv := NewServer(testLogger(), NewRuntime(cfg))
+	srv := NewServer(testLogger(), NewRuntime(cfg), nil)
 
 	if _, err := srv.Reload(context.Background(), cfg); err == nil {
 		t.Fatal("Reload before Start returned nil, want an error")
@@ -156,7 +201,7 @@ func TestStartRollbackClosesBoundSockets(t *testing.T) {
 		Pools:     map[string]config.PoolConfig{"web": {Servers: []string{"127.0.0.1:9000"}}},
 	}
 
-	srv := NewServer(testLogger(), NewRuntime(cfg))
+	srv := NewServer(testLogger(), NewRuntime(cfg), nil)
 	if err := srv.Start(); err == nil {
 		t.Fatalf("Start succeeded although %s was already in use", taken.Addr())
 	}
@@ -173,7 +218,7 @@ func TestStartRollbackClosesBoundSockets(t *testing.T) {
 // The faulty handler is installed before Start, so no accept goroutine ever
 // observes a concurrent write to the field.
 func TestPanicInHandlerIsContained(t *testing.T) {
-	srv := NewServer(testLogger(), NewRuntime(edgeConfig([]string{"127.0.0.1:9000"}, nil)))
+	srv := NewServer(testLogger(), NewRuntime(edgeConfig([]string{"127.0.0.1:9000"}, nil)), nil)
 	srv.proxy = nil // every connection now panics inside its handler goroutine
 	addr := startServer(t, srv)
 
@@ -189,7 +234,7 @@ func TestPanicInHandlerIsContained(t *testing.T) {
 // refused instead of re-publishing a configuration on a closed server.
 func TestReloadAfterShutdownFails(t *testing.T) {
 	cfg := edgeConfig([]string{"127.0.0.1:9000"}, nil)
-	srv := NewServer(testLogger(), NewRuntime(cfg))
+	srv := NewServer(testLogger(), NewRuntime(cfg), nil)
 	startServer(t, srv)
 
 	if err := srv.Shutdown(context.Background()); err != nil {
@@ -246,7 +291,7 @@ func TestReloadReconcilesListeners(t *testing.T) {
 	a := config.ListenerConfig{Name: "a", Addr: "127.0.0.1:0", UpstreamPool: "web", DialTimeout: time.Second}
 	b := config.ListenerConfig{Name: "b", Addr: "127.0.0.1:0", UpstreamPool: "web", DialTimeout: time.Second}
 
-	srv := NewServer(testLogger(), NewRuntime(base(a)))
+	srv := NewServer(testLogger(), NewRuntime(base(a)), nil)
 	startServer(t, srv)
 
 	if _, err := srv.Reload(context.Background(), base(a, b)); err != nil {

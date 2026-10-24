@@ -37,7 +37,7 @@ func TestMaxConnsSurvivesReload(t *testing.T) {
 		return edgeConfig([]string{echoAddr}, func(lc *config.ListenerConfig) { lc.MaxConns = 1 })
 	}
 
-	srv := NewServer(testLogger(), NewRuntime(mk()))
+	srv := NewServer(testLogger(), NewRuntime(mk()), nil)
 	addr := startServer(t, srv)
 
 	first := roundTrip(t, addr)
