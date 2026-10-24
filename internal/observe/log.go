@@ -1,4 +1,5 @@
-// Package observe owns logging, metrics and (later) tracing.
+// Package observe owns logging, metrics and the admin endpoint — everything
+// that makes the running proxy observable.
 //
 // For the first iteration we use the standard library log/slog: zero
 // dependencies and structured output. It can be swapped for zerolog later
@@ -6,24 +7,36 @@
 package observe
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
 )
 
-// NewLogger builds a structured logger writing to stderr.
-func NewLogger(level string) *slog.Logger {
-	var lvl slog.Level
-	switch strings.ToLower(strings.TrimSpace(level)) {
+// ParseLevel converts a textual log level ("debug", "info", "warn", "warning",
+// "error") into a slog.Level.
+//
+// Text exists only at the boundaries (the CLI flag, later the config file);
+// everywhere else the program passes slog.Level around — the type-safe enum
+// the standard library already provides, so there is nothing of ours to keep
+// in sync. An unknown string is an error, not a silent fallback: a typo in
+// -log-level should stop the process, not quietly hide the logs.
+func ParseLevel(s string) (slog.Level, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "debug":
-		lvl = slog.LevelDebug
+		return slog.LevelDebug, nil
+	case "info":
+		return slog.LevelInfo, nil
 	case "warn", "warning":
-		lvl = slog.LevelWarn
+		return slog.LevelWarn, nil
 	case "error":
-		lvl = slog.LevelError
+		return slog.LevelError, nil
 	default:
-		lvl = slog.LevelInfo
+		return 0, fmt.Errorf("observe: unknown log level %q (want debug, info, warn or error)", s)
 	}
-	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
-	return slog.New(handler)
+}
+
+// NewLogger builds a structured logger writing to stderr at the given level.
+func NewLogger(level slog.Level) *slog.Logger {
+	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 }

@@ -35,7 +35,11 @@ func run() error {
 	)
 	flag.Parse()
 
-	log := observe.NewLogger(*logLevel)
+	level, err := observe.ParseLevel(*logLevel)
+	if err != nil {
+		return err
+	}
+	log := observe.NewLogger(level)
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
