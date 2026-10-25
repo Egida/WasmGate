@@ -149,11 +149,14 @@ func (m *Metrics) Snapshot() MetricsSnapshot {
 func (m *Metrics) WritePrometheus(w io.Writer, upstreams []UpstreamStat) {
 	s := m.Snapshot()
 
-	counter := func(name, help string, v int64) {
-		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %d\n", name, help, name, name, v)
+	// The helpers take the value as `any` so counters (int64) and gauges built
+	// from uint64 fields render without a narrowing conversion gosec would
+	// flag; the values here cannot approach the overflow boundary.
+	counter := func(name, help string, v any) {
+		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s counter\n%s %v\n", name, help, name, name, v)
 	}
-	gauge := func(name, help string, v int64) {
-		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %d\n", name, help, name, name, v)
+	gauge := func(name, help string, v any) {
+		fmt.Fprintf(w, "# HELP %s %s\n# TYPE %s gauge\n%s %v\n", name, help, name, name, v)
 	}
 
 	counter("wasmgate_connections_accepted_total", "Client connections accepted.", s.ConnectionsAccepted)
@@ -162,8 +165,8 @@ func (m *Metrics) WritePrometheus(w io.Writer, upstreams []UpstreamStat) {
 	counter("wasmgate_connections_limit_rejected_total", "Connections refused because max_conns was reached.", s.ConnectionsLimitRejected)
 	counter("wasmgate_upstream_dial_failures_total", "Upstream dials that failed.", s.UpstreamDialFailures)
 	counter("wasmgate_relayed_bytes_total", "Bytes relayed in both directions.", s.RelayedBytes)
-	counter("wasmgate_reloads_total", "Successful configuration reloads.", int64(s.Reloads))
-	gauge("wasmgate_config_version", "Version of the current configuration snapshot.", int64(s.ConfigVersion))
+	counter("wasmgate_reloads_total", "Successful configuration reloads.", s.Reloads)
+	gauge("wasmgate_config_version", "Version of the current configuration snapshot.", s.ConfigVersion)
 	fmt.Fprintf(w, "# HELP wasmgate_uptime_seconds %s\n# TYPE wasmgate_uptime_seconds gauge\nwasmgate_uptime_seconds %.3f\n", "Seconds since process start.", s.Uptime.Seconds())
 
 	if len(upstreams) > 0 {
@@ -179,7 +182,7 @@ func (m *Metrics) WritePrometheus(w io.Writer, upstreams []UpstreamStat) {
 	var ms runtime.MemStats
 	runtime.ReadMemStats(&ms)
 	gauge("go_goroutines", "Number of goroutines.", int64(runtime.NumGoroutine()))
-	gauge("go_mem_heap_alloc_bytes", "Bytes of allocated heap objects.", int64(ms.HeapAlloc))
+	gauge("go_mem_heap_alloc_bytes", "Bytes of allocated heap objects.", ms.HeapAlloc)
 }
 
 // escapeLabel makes s safe inside a Prometheus label value: only the quote,

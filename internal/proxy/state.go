@@ -40,7 +40,7 @@ func newRegistry() *registry {
 // first use, and (re)sets its limit. The limit may change freely on reload: a
 // lower limit simply starts refusing new connections while the active count
 // drains down to it.
-func (g *registry) limiter(name string, max int64) *connLimiter {
+func (g *registry) limiter(name string, limit int64) *connLimiter {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	l := g.limiters[name]
@@ -48,7 +48,7 @@ func (g *registry) limiter(name string, max int64) *connLimiter {
 		l = &connLimiter{}
 		g.limiters[name] = l
 	}
-	l.max.Store(max)
+	l.max.Store(limit)
 	return l
 }
 
@@ -108,12 +108,12 @@ type connLimiter struct {
 // acquire reserves a slot, reporting false when the limit is currently reached.
 func (l *connLimiter) acquire() bool {
 	for {
-		max := l.max.Load()
-		if max <= 0 {
+		lim := l.max.Load()
+		if lim <= 0 {
 			return true // unlimited
 		}
 		cur := l.cur.Load()
-		if cur >= max {
+		if cur >= lim {
 			return false
 		}
 		if l.cur.CompareAndSwap(cur, cur+1) {

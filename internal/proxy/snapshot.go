@@ -14,7 +14,7 @@ import (
 // of scanning the listener list and then looking up the pool.
 type resolvedListener struct {
 	cfg  config.ListenerConfig
-	pool *Pool
+	pool *pool
 	// limiter enforces cfg.MaxConns; nil means "unlimited" (max_conns == 0).
 	// The limiter itself survives reloads (see state.go), so the count does not
 	// reset when the configuration is re-published.
@@ -92,14 +92,14 @@ func (r *Runtime) Reload(cfg *config.Config) uint64 {
 }
 
 // build compiles cfg into a ready-to-use Snapshot: it turns every configured
-// pool into a live Pool (upstreams + balancer), pre-resolves every listener to
+// pool into a live pool (upstreams + balancer), pre-resolves every listener to
 // its pool (and its connection limiter), and tags the result with the given
 // version. All allocation happens here, up front, so the data path only ever
 // reads.
 //
 // Caller must hold r.mu (or be the single-threaded constructor).
 func (r *Runtime) build(version uint64, cfg *config.Config) *Snapshot {
-	pools := make(map[string]*Pool, len(cfg.Pools))
+	pools := make(map[string]*pool, len(cfg.Pools))
 	for name, pc := range cfg.Pools {
 		pools[name] = newPool(name, pc.Servers, pc.Balance, r.registry)
 	}

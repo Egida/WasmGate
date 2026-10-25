@@ -248,6 +248,14 @@ go vet ./...        # встроенный анализатор
 golangci-lint run   # конфиг в .golangci.yml
 ```
 
+> golangci-lint v1.64 (как и конфиг) не читает export data тулчейнов новее 1.24,
+> поэтому с локальным Go 1.27 запускай его под пином тулчейна — та же версия
+> линтера и тот же тулчейн, что в CI:
+>
+> ```powershell
+> $env:GOTOOLCHAIN="go1.23.12"; go run github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8 run ./...
+> ```
+
 ### 4.5. Зависимости
 
 ```powershell
@@ -381,7 +389,7 @@ main.run()
 | `snapshot.go` | `Snapshot`, `Runtime` | иммутабельный конфиг + `atomic.Pointer`; **шов hot reload** |
 | `server.go` | `Server` | bind/`Reload` листенеров, `acceptLoop`, `Shutdown` (drain) |
 | `proxy.go` | `Proxy.Handle` | обработка одного соединения |
-| `pool.go` | `Pool` | `Next()` (reserve) / `Release()` |
+| `pool.go` | `pool` | `Next()` (reserve) / `Release()` |
 | `upstream.go` | `upstream`, `Balancer` | эндпоинт + счётчик; `round_robin`, `least_conn` |
 | `state.go` | `registry`, `connLimiter` | счётчики, переживающие reload (лимит, active) |
 | `copy.go` | `join`, `copyConn`, `activityReader` | двунаправленный pump; `io.Copy` → `splice(2)` на fast path, connection-wide idle watchdog с пулом буферов иначе |

@@ -68,8 +68,11 @@ func TestLimiterLimitChangeOnReloadTakesEffect(t *testing.T) {
 
 	rt := NewRuntime(withMax(2))
 	first := rt.Load().listeners["edge"].limiter
-	if !first.acquire() || !first.acquire() {
-		t.Fatal("max_conns 2 refused a connection below the limit")
+	if !first.acquire() {
+		t.Fatal("max_conns 2 refused the first connection below the limit")
+	}
+	if !first.acquire() {
+		t.Fatal("max_conns 2 refused the second connection below the limit")
 	}
 	if first.acquire() {
 		t.Fatal("max_conns 2 admitted a third connection")

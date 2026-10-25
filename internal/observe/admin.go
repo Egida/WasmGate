@@ -66,7 +66,7 @@ func (a *Admin) Shutdown(ctx context.Context) error {
 func (a *Admin) handler(m *Metrics, upstreams func() []UpstreamStat, log *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		var ups []UpstreamStat
 		if upstreams != nil {
 			ups = upstreams()
@@ -75,7 +75,7 @@ func (a *Admin) handler(m *Metrics, upstreams func() []UpstreamStat, log *slog.L
 		m.WritePrometheus(w, ups)
 	})
 
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		s := m.Snapshot()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(struct {

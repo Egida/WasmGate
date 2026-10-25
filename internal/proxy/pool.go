@@ -1,13 +1,13 @@
 package proxy
 
-// Pool groups upstreams under a single balancing strategy.
+// pool groups upstreams under a single balancing strategy.
 //
-// A Pool is (re)built from a configuration snapshot, but the *upstream objects
+// A pool is (re)built from a configuration snapshot, but the *upstream objects
 // it points at come from the long-lived registry, so their active counters keep
 // counting across reloads (see state.go). Callers hold the exact *upstream they
 // reserved, so a pool rebuilt during a reload can never decrement the wrong
 // counter.
-type Pool struct {
+type pool struct {
 	name     string      // pool name from the config (used in logs)
 	servers  []*upstream // upstreams in config order; balancers rely on this order
 	balancer Balancer    // strategy chosen from PoolConfig.Balance
@@ -20,7 +20,7 @@ type Pool struct {
 // Precondition: servers must be non-empty. Config validation guarantees this,
 // and an empty slice here would make balancer selection panic, so we fail fast
 // on a programming error.
-func newPool(name string, servers []string, balance string, g *registry) *Pool {
+func newPool(name string, servers []string, balance string, g *registry) *pool {
 	if len(servers) == 0 {
 		panic("proxy: newPool called with an empty server list")
 	}
@@ -28,12 +28,12 @@ func newPool(name string, servers []string, balance string, g *registry) *Pool {
 	for _, s := range servers {
 		ups = append(ups, g.upstream(s))
 	}
-	return &Pool{name: name, servers: ups, balancer: newBalancer(balance)}
+	return &pool{name: name, servers: ups, balancer: newBalancer(balance)}
 }
 
 // Next reserves the chosen upstream. The caller MUST call Release with the
 // returned pointer exactly once when the connection is done.
-func (p *Pool) Next() *upstream {
+func (p *pool) Next() *upstream {
 	u := p.balancer.Next(p.servers)
 	u.active.Add(1)
 	return u
@@ -44,7 +44,7 @@ func (p *Pool) Next() *upstream {
 // The decrement is guarded so a stray double-Release cannot drive the counter
 // negative: a negative active count would make least_conn consider the upstream
 // "extra free" and funnel ever more connections to it.
-func (p *Pool) Release(u *upstream) {
+func (p *pool) Release(u *upstream) {
 	if u == nil {
 		return
 	}
@@ -60,4 +60,4 @@ func (p *Pool) Release(u *upstream) {
 }
 
 // Name returns the pool name (used in logs).
-func (p *Pool) Name() string { return p.name }
+func (p *pool) Name() string { return p.name }

@@ -18,7 +18,7 @@
 //   - snapshot.go — Snapshot (immutable config view) and Runtime (atomic publish).
 //   - server.go   — Server: binds/reconciles listeners, runs accept loops, drains on shutdown.
 //   - proxy.go    — Proxy.Handle: the per-connection pipeline (the hot path).
-//   - pool.go     — Pool: a set of upstreams behind one balancing strategy.
+//   - pool.go     — pool: a set of upstreams behind one balancing strategy.
 //   - upstream.go — upstream endpoint and Balancer strategies (round-robin, least-conn).
 //   - state.go    — registry: counters (connection limits, active) that outlive a snapshot.
 //   - copy.go     — join: bidirectional byte pump with half-close; zero-copy

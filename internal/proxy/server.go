@@ -135,7 +135,7 @@ func (s *Server) Reload(ctx context.Context, cfg *config.Config) (uint64, error)
 	}
 
 	next := make(map[string]boundListener, len(cfg.Listeners))
-	var opened []string // names bound by this reload; their loops start after swap
+	opened := make([]string, 0, len(cfg.Listeners)) // names bound by this reload; their loops start after swap
 
 	for _, l := range cfg.Listeners {
 		if cur, ok := s.ln[l.Name]; ok && cur.cfgAddr == l.Addr {
